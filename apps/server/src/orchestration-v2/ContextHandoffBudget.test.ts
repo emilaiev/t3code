@@ -706,6 +706,8 @@ describe("handoff delivery with a refreshed budget", () => {
         injected[0]?.messages.map((item) => item.itemId),
         messages.map((item) => item.itemId),
       );
+      assert.include(injected[0]!.context, handoff.history!.coverage);
+      assert.notInclude(injected[0]!.context, "detailed coverage references omitted");
       assert.lengthOf(injected, 1);
       yield* result.delivered;
     }),

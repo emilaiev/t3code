@@ -167,6 +167,15 @@ describe("native active-context estimate", () => {
   });
 
   it("declines opaque provider state on any message or part", () => {
+    assert.isUndefined(
+      estimate([
+        checkpoint(),
+        {
+          ...assistant([{ type: "text", text: "answer" }]),
+          providerState: { ciphertext: "AAAA" },
+        },
+      ]),
+    );
     // A text or reasoning part's own `state` is provider-native, like a tool's.
     assert.isUndefined(
       estimate([

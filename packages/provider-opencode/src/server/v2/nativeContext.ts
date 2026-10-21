@@ -36,6 +36,7 @@ const fileAllowances = (message: SessionMessage.Info): number | undefined => {
       return allowance;
     }
     case "assistant": {
+      if (message.providerState !== undefined) return undefined;
       let allowance = 0;
       for (const part of message.content) {
         if (part.type === "text" || part.type === "reasoning") {
