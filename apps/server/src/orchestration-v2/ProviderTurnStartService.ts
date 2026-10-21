@@ -37,6 +37,8 @@ import {
   DEFAULT_HANDOFF_TOKEN_CAP,
   handoffTokenCapConfig,
   handoffBudget,
+  handoffContextWindow,
+  withNativeContextEstimate,
   attachmentTokenAllowance,
   contextUsageForHandoff,
   historicalMessage,
@@ -1159,6 +1161,40 @@ export const layer: Layer.Layer<
                 !coveredItemIds.has(item.id) &&
                 historicalMessage(item) !== null,
             );
+      const budgetInput = Effect.fn("ProviderTurnStartService.handoffBudgetInput")(function* (
+        forBudget: OrchestrationV2ProviderThread,
+      ) {
+        return {
+          tokenCap,
+          modelContextWindow,
+          userText: restartNote === "" ? userText : `${restartNote}\n\n${userText}`,
+          attachments: message.attachments,
+          providerThread: forBudget,
+          nativeContextEstimate:
+            forBudget.contextUsage?.usedTokens === undefined ? yield* nativeContextEstimate : 0,
+        };
+      });
+      const handoffAllowance = (forBudget: OrchestrationV2ProviderThread) =>
+        Effect.map(budgetInput(forBudget), handoffBudget);
+      // A stale measured count can keep a small post-compaction transcript refused
+      // for good. Only a fresh, identity-checked native read may outrank it, and
+      // only for this delivery's allowance.
+      const refreshBudgetFor = (compact: boolean) =>
+        compact || !sameNativeThread || session.estimateNativeContext === undefined
+          ? undefined
+          : Effect.gen(function* () {
+              const estimate = yield* session.estimateNativeContext!({
+                providerThread: runningProviderThread,
+                maxBytes: handoffContextWindow({
+                  providerThread: budgetProviderThread,
+                  modelContextWindow,
+                }),
+              });
+              if (estimate === undefined) return yield* handoffAllowance(budgetProviderThread);
+              return yield* handoffAllowance(
+                withNativeContextEstimate(budgetProviderThread, estimate),
+              );
+            });
       const startWithHandoffs = Effect.fn("ProviderTurnStartService.startWithHandoffs")(
         function* (turnInput: Parameters<typeof session.startTurn>[0], compact = false) {
           const retryHandoff =
@@ -1183,23 +1219,13 @@ export const layer: Layer.Layer<
                     createdAt: yield* DateTime.now,
                   }),
                 ];
+          const refreshBudget = refreshBudgetFor(compact);
           const delivery = yield* deliverContextHandoffs({
             handoffs: [...effectiveHandoffs, ...retryHandoff],
             deferInline: compact,
             providerThread: runningProviderThread,
-            budget: Effect.gen(function* () {
-              return handoffBudget({
-                tokenCap,
-                modelContextWindow,
-                userText: restartNote === "" ? userText : `${restartNote}\n\n${userText}`,
-                attachments: message.attachments,
-                providerThread: budgetProviderThread,
-                nativeContextEstimate:
-                  budgetProviderThread.contextUsage?.usedTokens === undefined
-                    ? yield* nativeContextEstimate
-                    : 0,
-              });
-            }),
+            budget: handoffAllowance(budgetProviderThread),
+            ...(refreshBudget === undefined ? {} : { refreshBudget }),
             alreadyDeliveredItemIds: deliveredItemIds,
             ...(session.injectHistory === undefined
               ? {}

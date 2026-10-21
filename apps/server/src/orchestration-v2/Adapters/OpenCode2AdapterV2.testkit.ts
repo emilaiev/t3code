@@ -109,6 +109,7 @@ const operationOf = (
       return { type: "session.inbox.cancel", input: { ...input, inboxID } };
     }
     if (method === "GET" && rest === "/message") return { type: "message.list", input };
+    if (method === "GET" && rest === "/context") return { type: "session.context", input };
     if (method === "GET" && rest === "/permission") return { type: "permission.list", input };
     if (method === "GET" && rest === "/form") return { type: "session.form.list", input };
     const form = /^\/form\/([^/]+)(\/reply)?$/.exec(rest);

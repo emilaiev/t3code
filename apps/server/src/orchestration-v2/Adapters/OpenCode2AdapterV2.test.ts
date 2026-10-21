@@ -410,6 +410,45 @@ const history = {
   cursor: {},
 };
 
+const startedActiveContext = (entries: ReadonlyArray<ProviderReplayEntry>, maxBytes = 128_000) =>
+  Effect.gen(function* () {
+    const { runtime, thread } = yield* resumed(entries);
+    const estimate = yield* runtime.estimateNativeContext!({ providerThread: thread, maxBytes });
+    return estimate;
+  });
+
+const activeCheckpoint = {
+  id: "msg_cmp_1",
+  type: "compaction",
+  status: "completed",
+  reason: "manual",
+  summary: "Earlier work is summarised here.",
+  recent: "The retained recent tail.",
+  time: { created: 1790656602000 },
+};
+
+const activeUser = (...files: ReadonlyArray<unknown>) => ({
+  id: "msg_user_1",
+  type: "user",
+  text: "Continue after the compaction",
+  time: { created: 1790656602100 },
+  ...(files.length === 0 ? {} : { files }),
+});
+
+const activeAssistant = (content: ReadonlyArray<unknown>) => ({
+  id: "msg_asst_1",
+  type: "assistant",
+  agent: "build",
+  model: { id: "big-pickle", providerID: "opencode" },
+  content,
+  time: { created: 1790656602200 },
+});
+
+const readActiveContext = (body: unknown): ReadonlyArray<ProviderReplayEntry> => [
+  out("session.context", { sessionID: SESSION }),
+  reply("session.context", body),
+];
+
 it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
   it.effect("switches the session's model and variant before a turn that changed them", () =>
     Effect.gen(function* () {
@@ -4391,3 +4430,201 @@ const providerTurnId = Effect.gen(function* () {
     nativeTurnId: `${SESSION}:attempt:attempt:opencode2-adapter`,
   });
 }).pipe(Effect.provide(IdAllocator.layer));
+it.layer(McpProviderSessions.layer)("OpenCode native context accounting", (it) => {
+
+  it.effect("counts every wire byte of the active context, including fields this build drops", () =>
+    Effect.gen(function* () {
+      // A 2.0.32 server can carry fields 2.0.28 does not decode; only the raw
+      // body says how much the provider is actually holding.
+      const body = {
+        data: [activeCheckpoint, activeUser(), activeAssistant([{ type: "text", text: "Done" }])],
+        serverRevision: "z".repeat(4_096),
+      };
+      const estimate = yield* startedActiveContext(readActiveContext(body));
+      assert.equal(estimate, Buffer.byteLength(JSON.stringify(body)));
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("prices native file references on top of the wire bytes", () =>
+    Effect.gen(function* () {
+      const body = {
+        data: [
+          activeCheckpoint,
+          activeUser(
+            { data: "aGVsbG8=", mime: "image/png", source: { type: "inline" } },
+            {
+              data: "aGVsbG8=",
+              mime: "application/pdf",
+              source: { type: "uri", uri: "file:///r.p" },
+            },
+          ),
+          activeAssistant([
+            {
+              type: "tool",
+              id: "call_1",
+              name: "read",
+              time: { created: 1790656602300 },
+              state: {
+                status: "completed",
+                input: {},
+                content: [{ type: "file", uri: "file:///shot.png", mime: "image/png" }],
+              },
+            },
+          ]),
+        ],
+      };
+      const estimate = yield* startedActiveContext(readActiveContext(body));
+      assert.equal(estimate, Buffer.byteLength(JSON.stringify(body)) + 2 * 8_192 + 4_096);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("declines an active context larger than the window instead of sizing a prefix", () =>
+    Effect.gen(function* () {
+      const body = {
+        data: [activeCheckpoint, { ...activeUser(), text: "y".repeat(400_000) }],
+      };
+      const estimate = yield* startedActiveContext(readActiveContext(body), 64_000);
+      assert.isUndefined(estimate);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("gives up on a stalled active-context read instead of holding the turn", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        out("session.context", { sessionID: SESSION }),
+        reply("session.context", "<hang>"),
+      ]);
+      const read = yield* runtime.estimateNativeContext!({
+        providerThread: thread,
+        maxBytes: 128_000,
+      }).pipe(Effect.forkScoped);
+      yield* TestClock.adjust("11 seconds");
+      assert.isUndefined(yield* Fiber.join(read));
+    }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("declines an opaque checkpoint and an answer it cannot decode", () =>
+    Effect.gen(function* () {
+      const native = yield* startedActiveContext(
+        readActiveContext({
+          data: [
+            {
+              ...activeCheckpoint,
+              providerState: { ciphertext: "AAAA" },
+            },
+          ],
+        }),
+      );
+      assert.isUndefined(native);
+      const opaquePart = yield* startedActiveContext(
+        readActiveContext({
+          data: [
+            activeCheckpoint,
+            activeAssistant([{ type: "text", text: "answer", state: { ciphertext: "AAAA" } }]),
+          ],
+        }),
+      );
+      assert.isUndefined(opaquePart);
+      const mismatched = yield* startedActiveContext(
+        readActiveContext({
+          data: [{ ...activeAssistant([{ type: "text", text: "no agent" }]), agent: undefined }],
+        }),
+      );
+      assert.isUndefined(mismatched);
+      const notAnArray = yield* startedActiveContext(readActiveContext({ data: { messages: [] } }));
+      assert.isUndefined(notAnArray);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("declines a window whose compaction never completed", () =>
+    Effect.gen(function* () {
+      // A failed or no-op compact leaves no completed boundary, so nothing about
+      // this answer can unlock delivery.
+      const running = yield* startedActiveContext(
+        readActiveContext({
+          data: [{ ...activeCheckpoint, status: "running" }, activeUser()],
+        }),
+      );
+      assert.isUndefined(running);
+      const failed = yield* startedActiveContext(
+        readActiveContext({
+          data: [
+            {
+              ...activeCheckpoint,
+              status: "failed",
+              error: { type: "provider", message: "compaction failed" },
+            },
+            activeUser(),
+          ],
+        }),
+      );
+      assert.isUndefined(failed);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("declines a native session it did not attach or that has no native id", () =>
+    Effect.gen(function* () {
+      const { runtime } = yield* resumed([]);
+      const now = yield* DateTime.now;
+      const unattached = yield* runtime.estimateNativeContext!({
+        providerThread: {
+          ...providerThread(now),
+          nativeThreadRef: { ...providerThread(now).nativeThreadRef!, nativeId: "ses_other" },
+        },
+        maxBytes: 128_000,
+      });
+      assert.isUndefined(unattached);
+      const noNative = yield* runtime.estimateNativeContext!({
+        providerThread: { ...providerThread(now), nativeThreadRef: null },
+        maxBytes: 128_000,
+      });
+      assert.isUndefined(noNative);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("discards an answer that arrives after the thread was unloaded", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        out("session.context", { sessionID: SESSION }),
+        {
+          type: "emit_inbound",
+          frame: {
+            type: "sdk.response",
+            operation: "session.context",
+            data: { data: [activeCheckpoint, activeUser()] },
+          },
+          afterMs: 1_000,
+        },
+      ]);
+      const read = yield* runtime.estimateNativeContext!({
+        providerThread: thread,
+        maxBytes: 128_000,
+      }).pipe(Effect.forkScoped);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      yield* runtime.unloadThread!({ providerThread: thread });
+      yield* TestClock.adjust("1 second");
+      assert.isUndefined(yield* Fiber.join(read));
+    }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("lets a cancelled read stop without estimating or sending anything", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        out("session.context", { sessionID: SESSION }),
+        reply("session.context", "<hang>"),
+      ]);
+      const read = yield* runtime.estimateNativeContext!({
+        providerThread: thread,
+        maxBytes: 128_000,
+      }).pipe(Effect.forkScoped);
+      // Let the read reach the server before cancelling it, so the replay proves
+      // that a cancelled estimate asks for nothing else.
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      yield* Fiber.interrupt(read);
+      const exit = yield* Fiber.await(read);
+      assert.isTrue(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause));
+    }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+  );
+});

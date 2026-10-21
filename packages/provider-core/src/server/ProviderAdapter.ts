@@ -580,6 +580,16 @@ export interface ProviderAdapterV2SessionRuntime {
     cwd?: string | null,
   ) => number | undefined;
   readonly canReuseContextUsage?: (previous: ModelSelection, next: ModelSelection) => boolean;
+  /**
+   * A fresh estimate of the attached native transcript's active context, in tokens,
+   * for this turn's handoff budget. Absent when the provider cannot read it without
+   * starting work. `maxBytes` caps how much of the native answer may be read.
+   * An absent or failed estimate is not a zero: callers keep their existing usage.
+   */
+  readonly estimateNativeContext?: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+    readonly maxBytes: number;
+  }) => Effect.Effect<number | undefined, ProviderAdapterV2Error>;
   readonly ensureThread: (
     input: ProviderAdapterV2EnsureThreadInput,
   ) => Effect.Effect<OrchestrationV2ProviderThread, ProviderAdapterV2Error>;

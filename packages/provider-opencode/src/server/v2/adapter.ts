@@ -47,6 +47,7 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
 import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
@@ -88,6 +89,7 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import { turnScopedSelectionTransition } from "@t3tools/provider-core/server/selectionTransition";
 import { OPENCODE_PROVIDER, openCodePermissionRequestKind } from "../adapter.ts";
 import { openCodeToolTurnItem } from "../toolItems.ts";
+import { estimateNativeContext as nativeContextEstimate } from "./nativeContext.ts";
 
 const OpenCode2ProviderCapabilities = {
   sessions: {
@@ -3450,6 +3452,49 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         selection.instanceId === instanceId
           ? windowOf(cwd === undefined ? session.cwd : cwd, selection.model)
           : undefined,
+      estimateNativeContext: Effect.fn("OpenCode2Adapter.estimateNativeContext")(
+        function* (estimateInput) {
+          const sessionId = estimateInput.providerThread.nativeThreadRef?.nativeId;
+          // A thread without a native session has nothing this provider can read.
+          if (sessionId === undefined || sessionId === null) return undefined;
+          // Only an attached, idle session answers for the turn about to start.
+          const attached = () => {
+            const state = threads.get(sessionId);
+            return state !== undefined &&
+              state.active === undefined &&
+              !state.unsettled &&
+              !busy.has(sessionId)
+              ? state
+              : undefined;
+          };
+          const state = attached();
+          if (state === undefined) return undefined;
+          const bytes = yield* Ref.make(0);
+          const client = yield* connection.cappedClient({
+            maxBytes: estimateInput.maxBytes,
+            bytes,
+          });
+          return yield* client.session.context({ sessionID: Session.ID.make(sessionId) }).pipe(
+            Effect.flatMap((messages) =>
+              Ref.get(bytes).pipe(
+                Effect.map((wireBytes) => nativeContextEstimate(messages, wireBytes)),
+              ),
+            ),
+            // The cap collector drains past its bound, so the whole read keeps a
+            // deadline rather than leaving a starting turn waiting on a stalled server.
+            Effect.timeout(REQUEST_REPLY_TIMEOUT),
+            // No answer is not zero occupancy: the caller keeps its measured
+            // usage and the refusal that already explains it.
+            Effect.catchCause((cause) =>
+              Effect.logDebug("Could not estimate the OpenCode active context.", cause).pipe(
+                Effect.as<number | undefined>(undefined),
+              ),
+            ),
+            // The mapping or the turn can change while the answer is in flight.
+            Effect.map((estimate) => (attached() === state ? estimate : undefined)),
+          );
+        },
+      ),
       ensureThread: Effect.fn("OpenCode2Adapter.ensureThread")(
         function* (threadInput) {
           if (threadInput.existingProviderThread?.nativeThreadRef != null) {

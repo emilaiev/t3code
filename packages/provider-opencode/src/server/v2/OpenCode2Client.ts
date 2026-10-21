@@ -1,10 +1,12 @@
 import { OpenCode, type OpenCodeClient } from "@opencode/client/effect";
 import { OpenCodeEvent } from "@opencode/protocol/groups/event";
+import { collectUint8StreamText } from "@t3tools/provider-core/server/collectStreamText";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
+import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -56,6 +58,17 @@ export type OpenCode2StreamEvent =
  */
 export interface OpenCode2Api {
   readonly client: OpenCodeClient;
+  /**
+   * A client on the same authenticated transport that reads each answer whole, up
+   * to `maxBytes`, before the protocol decodes it. A body cut at the cap or not
+   * UTF-8 fails here rather than decoding as something shorter, and `bytes`
+   * holds the wire size of the answer it rebuilt: the protocol drops fields it
+   * does not know, so its own values cannot say how much actually arrived.
+   */
+  readonly cappedClient: (options: {
+    readonly maxBytes: number;
+    readonly bytes: Ref.Ref<number>;
+  }) => Effect.Effect<OpenCodeClient>;
   readonly events: Effect.Effect<
     Stream.Stream<
       OpenCode2StreamEvent,
@@ -151,6 +164,51 @@ const basicAuthorization = (password: string | Redacted.Redacted) => {
   return `Basic ${Buffer.from(`${OPENCODE_USERNAME}:${plain}`, "utf8").toString("base64")}`;
 };
 
+/**
+ * Reads each answer whole, up to `maxBytes`, and hands the protocol a body built
+ * from exactly those bytes. `collectUint8StreamText` keeps draining past the cap
+ * without buffering more, so callers must still bound the whole request.
+ */
+const capResponseBody = (
+  client: HttpClient.HttpClient,
+  options: { readonly maxBytes: number; readonly bytes: Ref.Ref<number> },
+) =>
+  HttpClient.transformResponse(client, (effect) =>
+    Effect.flatMap(effect, (response) =>
+      collectUint8StreamText({ stream: response.stream, maxBytes: options.maxBytes }).pipe(
+        Effect.catchIf(
+          (error) => error.reason._tag === "EmptyBodyError",
+          () => Effect.succeed({ text: "", truncated: false, bytes: 0, invalidUtf8: false }),
+        ),
+        Effect.flatMap((collected) =>
+          collected.truncated || collected.invalidUtf8
+            ? Effect.fail(
+                new HttpClientError.HttpClientError({
+                  reason: new HttpClientError.DecodeError({
+                    request: response.request,
+                    response,
+                    description: collected.truncated
+                      ? `The answer is longer than ${options.maxBytes} bytes.`
+                      : "The answer is not UTF-8 text.",
+                  }),
+                }),
+              )
+            : Ref.set(options.bytes, collected.bytes).pipe(
+                Effect.as(
+                  HttpClientResponse.fromWeb(
+                    response.request,
+                    new Response(collected.text === "" ? null : collected.text, {
+                      status: response.status,
+                      headers: response.headers,
+                    }),
+                  ),
+                ),
+              ),
+        ),
+      ),
+    ),
+  );
+
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
   const httpClient = yield* HttpClient.HttpClient;
@@ -160,10 +218,12 @@ export const make = Effect.gen(function* () {
         httpClient,
         HttpClientRequest.setHeader("Authorization", basicAuthorization(password)),
       );
-      return OpenCode.make({ baseUrl }).pipe(
-        Effect.provideService(HttpClient.HttpClient, authenticated),
+      const makeClient = (transport: HttpClient.HttpClient) =>
+        OpenCode.make({ baseUrl }).pipe(Effect.provideService(HttpClient.HttpClient, transport));
+      return makeClient(authenticated).pipe(
         Effect.map((client) => ({
           client,
+          cappedClient: (options) => makeClient(capResponseBody(authenticated, options)),
           events: readEvents.pipe(
             Effect.provideService(
               HttpClient.HttpClient,

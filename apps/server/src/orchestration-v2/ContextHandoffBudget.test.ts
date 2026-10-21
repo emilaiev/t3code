@@ -15,6 +15,7 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Schema from "effect/Schema";
 import {
   contextUsageForHandoff,
@@ -638,6 +639,169 @@ describe("handoff delivery", () => {
       }).pipe(Effect.result);
       assert.equal(result._tag, "Failure");
       assert.equal(calls, 0);
+    }),
+  );
+});
+
+describe("handoff delivery with a refreshed budget", () => {
+  const oversized = message("item:oversized", "user", "x".repeat(20_000));
+  const withOversized: OrchestrationV2ContextHandoff = {
+    ...handoff,
+    history: { ...handoff.history!, messages: [...messages, oversized] },
+  };
+
+  it.effect("re-selects once when a fitting wrapper still omitted a message", () =>
+    Effect.gen(function* () {
+      let refreshes = 0;
+      const injected: Array<ProviderAdapter.ProviderAdapterV2HistoricalContext> = [];
+      const result = yield* deliverContextHandoffs({
+        handoffs: [withOversized],
+        providerThread,
+        budget: 16_000,
+        refreshBudget: Effect.sync(() => {
+          refreshes++;
+          return 40_000;
+        }),
+        alreadyDeliveredItemIds: new Set(),
+        inject: (value) =>
+          Effect.sync(() => {
+            injected.push(value);
+            return true;
+          }),
+        persist: () => Effect.void,
+      });
+      assert.equal(refreshes, 1);
+      assert.lengthOf(injected, 1);
+      assert.deepEqual(
+        injected[0]!.messages.map((item) => item.itemId),
+        [...messages, oversized].map((item) => item.itemId),
+      );
+      yield* result.delivered;
+      assert.lengthOf(injected, 1);
+    }),
+  );
+
+  it.effect("unblocks an overflowing delivery with one fresh allowance", () =>
+    Effect.gen(function* () {
+      let refreshes = 0;
+      const injected: Array<ProviderAdapter.ProviderAdapterV2HistoricalContext> = [];
+      const result = yield* deliverContextHandoffs({
+        handoffs: [handoff],
+        providerThread,
+        budget: 0,
+        refreshBudget: Effect.sync(() => {
+          refreshes++;
+          return 16_000;
+        }),
+        alreadyDeliveredItemIds: new Set(),
+        inject: (value) =>
+          Effect.sync(() => {
+            injected.push(value);
+            return true;
+          }),
+        persist: () => Effect.void,
+      });
+      assert.equal(refreshes, 1);
+      assert.deepEqual(
+        injected[0]?.messages.map((item) => item.itemId),
+        messages.map((item) => item.itemId),
+      );
+      assert.lengthOf(injected, 1);
+      yield* result.delivered;
+    }),
+  );
+
+  it.effect("keeps the refusal when the refreshed allowance still does not fit", () =>
+    Effect.gen(function* () {
+      let refreshes = 0;
+      let persists = 0;
+      const result = yield* deliverContextHandoffs({
+        handoffs: [handoff],
+        providerThread,
+        budget: 0,
+        refreshBudget: Effect.sync(() => {
+          refreshes++;
+          return 100;
+        }),
+        alreadyDeliveredItemIds: new Set(),
+        inject: () => Effect.succeed(true),
+        persist: () =>
+          Effect.sync(() => {
+            persists++;
+          }),
+      }).pipe(Effect.flip);
+      assert.equal(result._tag, "ContextHandoffBudgetError");
+      assert.equal(refreshes, 1);
+      assert.equal(persists, 0);
+    }),
+  );
+
+  it.effect("does not read a fresh allowance for a compaction handoff", () =>
+    Effect.gen(function* () {
+      let refreshes = 0;
+      yield* deliverContextHandoffs({
+        handoffs: [handoff],
+        providerThread,
+        budget: 0,
+        deferInline: true,
+        refreshBudget: Effect.sync(() => {
+          refreshes++;
+          return 16_000;
+        }),
+        alreadyDeliveredItemIds: new Set(),
+        inject: () => Effect.succeed(false),
+        persist: () => Effect.void,
+      });
+      assert.equal(refreshes, 0);
+    }),
+  );
+
+  it.effect("leaves already delivered handoffs alone and never reads twice", () =>
+    Effect.gen(function* () {
+      let refreshes = 0;
+      const delivered: OrchestrationV2ContextHandoff = {
+        ...withOversized,
+        delivery: {
+          nativeThreadId: providerThread.nativeThreadRef!.nativeId!,
+          status: "injected",
+          itemIds: messages.map((item) => item.itemId),
+        },
+      };
+      yield* deliverContextHandoffs({
+        handoffs: [delivered],
+        providerThread,
+        budget: 0,
+        refreshBudget: Effect.sync(() => {
+          refreshes++;
+          return 40_000;
+        }),
+        alreadyDeliveredItemIds: new Set(),
+        inject: () => Effect.succeed(true),
+        persist: () => Effect.void,
+      });
+      assert.equal(refreshes, 0);
+    }),
+  );
+
+  it.effect("stops before any delivery when its read is cancelled", () =>
+    Effect.gen(function* () {
+      let persists = 0;
+      const deliver = deliverContextHandoffs({
+        handoffs: [handoff],
+        providerThread,
+        budget: 0,
+        refreshBudget: Effect.never,
+        alreadyDeliveredItemIds: new Set(),
+        inject: () => Effect.succeed(true),
+        persist: () =>
+          Effect.sync(() => {
+            persists++;
+          }),
+      });
+      const fiber = yield* Effect.forkChild(deliver);
+      yield* Effect.yieldNow;
+      yield* Fiber.interrupt(fiber);
+      assert.equal(persists, 0);
     }),
   );
 });

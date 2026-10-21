@@ -91,6 +91,20 @@ export function contextUsageForHandoff(input: {
   };
 }
 
+const IMAGE_TOKEN_ALLOWANCE = 8_192;
+const FILE_TOKEN_ALLOWANCE = 4_096;
+const MIME_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/;
+
+/**
+ * One native file reference's reservation, or undefined for a MIME string this
+ * build cannot place. A base64 or URI length says nothing about what the
+ * provider charges for the decoded file, so the reference itself is priced.
+ */
+export function nativeAttachmentTokenAllowance(mime: string): number | undefined {
+  if (!MIME_TYPE.test(mime)) return undefined;
+  return mime.startsWith("image/") ? IMAGE_TOKEN_ALLOWANCE : FILE_TOKEN_ALLOWANCE;
+}
+
 export function attachmentTokenAllowance(attachments: ReadonlyArray<ChatAttachment>): number {
   // Without dimensions/detail metadata, reserve 8k tokens per image, above typical
   // resized Codex/Claude image costs. This is a fallback estimate, not a bound for
@@ -98,9 +112,43 @@ export function attachmentTokenAllowance(attachments: ReadonlyArray<ChatAttachme
   // https://developers.openai.com/api/docs/guides/image-cost-calculator
   // https://platform.claude.com/docs/en/build-with-claude/vision
   return attachments.reduce(
-    (sum, attachment) => sum + (attachment.type === "image" ? 8_192 : 4_096),
+    (sum, attachment) =>
+      sum + (attachment.type === "image" ? IMAGE_TOKEN_ALLOWANCE : FILE_TOKEN_ALLOWANCE),
     0,
   );
+}
+
+/**
+ * The window every remaining bound applies to: the model's own limit, the last
+ * reported capacity and the configured compaction threshold, whichever is
+ * smallest. Callers that need the same window outside `handoffBudget` (for
+ * example to bound a native read) use this rather than restating the rule.
+ */
+export function handoffContextWindow(input: {
+  readonly providerThread: OrchestrationV2ProviderThread;
+  readonly modelContextWindow?: number | undefined;
+}): number {
+  const usage = input.providerThread.contextUsage;
+  return Math.min(
+    input.modelContextWindow ?? usage?.maxTokens ?? 128_000,
+    usage?.maxTokens ?? Infinity,
+    usage?.autoCompactThreshold ?? Infinity,
+  );
+}
+
+/**
+ * A copy whose occupancy comes from a freshly read native transcript, for one
+ * budget calculation. Reported capacity and the auto-compaction threshold stay:
+ * an estimate of what is used says nothing about either bound.
+ */
+export function withNativeContextEstimate(
+  providerThread: OrchestrationV2ProviderThread,
+  usedTokens: number,
+): OrchestrationV2ProviderThread {
+  return {
+    ...providerThread,
+    contextUsage: { ...providerThread.contextUsage, usedTokens },
+  };
 }
 
 // One UTF-8 byte per token is deliberately pessimistic for byte-based tokenizers,
@@ -115,11 +163,7 @@ export function handoffBudget(input: {
   readonly modelContextWindow?: number | undefined;
 }): number {
   const usage = input.providerThread.contextUsage;
-  const window = Math.min(
-    input.modelContextWindow ?? usage?.maxTokens ?? 128_000,
-    usage?.maxTokens ?? Infinity,
-    usage?.autoCompactThreshold ?? Infinity,
-  );
+  const window = handoffContextWindow(input);
   const native = usage?.usedTokens ?? input.nativeContextEstimate;
   const current =
     Buffer.byteLength(JSON.stringify(input.userText)) + attachmentTokenAllowance(input.attachments);
