@@ -888,6 +888,243 @@ describe("OrchestratorMcpService", () => {
       });
     }),
   );
+
+  describe("task and thread ids in failure messages", () => {
+    const parentThreadId = ThreadId.make("thread:mcp-ids-parent");
+    const planTaskId = NodeId.make("node:task-adly-plan-check");
+    const reviewTaskId = NodeId.make("node:task-adly-review");
+    const planChildThreadId = ThreadId.make("thread:mcp-ids-plan-child");
+    const reviewChildThreadId = ThreadId.make("thread:mcp-ids-review-child");
+    const scope: McpInvocationScope = {
+      environmentId: EnvironmentId.make("environment:mcp-ids"),
+      requestNamespace: "provider-session:mcp-ids",
+      thread: {
+        threadId: parentThreadId,
+        providerSessionId: "provider-session:mcp-ids",
+        providerInstanceId: ProviderInstanceId.make("codex"),
+      },
+      client: undefined,
+      capabilities: new Set(["orchestration"]),
+      issuedAt: 1,
+    };
+    const task = (input: {
+      readonly id: NodeId;
+      readonly threadId: ThreadId;
+      readonly childThreadId: ThreadId;
+      readonly title: string;
+      readonly status: "running" | "completed";
+    }) => ({
+      id: input.id,
+      threadId: input.threadId,
+      origin: "app_owned" as const,
+      childThreadId: input.childThreadId,
+      driver: "codex",
+      model: "gpt-5.6-terra",
+      title: input.title,
+      status: input.status,
+      result: null,
+    });
+    const projectionWith = (subagents: ReadonlyArray<unknown>) =>
+      ({
+        thread: { id: parentThreadId },
+        runs: [],
+        contextTransfers: [],
+        subagents,
+      }) as unknown as OrchestrationV2ThreadProjection;
+    const layerWith = (projection: OrchestrationV2ThreadProjection) =>
+      layerOrchestratorService.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getThreadRecords: () => Effect.succeed(projection),
+              getThreadShell: () => Effect.succeed(null),
+            }),
+            ServerSettings.layerTest(),
+            Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+            Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+              list: () => Effect.succeed([]),
+            }),
+            Layer.mock(ProjectService.ProjectService)({}),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+          ),
+        ),
+      );
+
+    it.effect("lists this thread's app-owned task ids when task_status gets an unknown id", () =>
+      Effect.gen(function* () {
+        const projection = projectionWith([
+          task({
+            id: reviewTaskId,
+            threadId: parentThreadId,
+            childThreadId: reviewChildThreadId,
+            title: "Review the patch",
+            status: "completed",
+          }),
+          task({
+            id: planTaskId,
+            threadId: parentThreadId,
+            childThreadId: planChildThreadId,
+            title: "Check the plan",
+            status: "running",
+          }),
+        ]);
+        const error = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.flatMap((service) =>
+            service.taskStatus(scope, NodeId.make("adly-plan-check-luna-31")),
+          ),
+          Effect.flip,
+          Effect.provide(layerWith(projection)),
+        );
+        assert.equal(error.code, "task_not_found");
+        for (const expected of [
+          planTaskId,
+          reviewTaskId,
+          "Check the plan",
+          "Review the patch",
+          "running",
+          "completed",
+        ]) {
+          assert.include(error.message, expected);
+        }
+        assert.isBelow(error.message.indexOf(planTaskId), error.message.indexOf(reviewTaskId));
+        assert.isBelow(error.message.length, 1200);
+      }),
+    );
+
+    it.effect("does not list app-owned tasks owned by another thread", () =>
+      Effect.gen(function* () {
+        const foreignThreadId = ThreadId.make("thread:mcp-ids-foreign");
+        const foreignTaskId = NodeId.make("node:task-foreign-plan-check");
+        const projection = projectionWith([
+          task({
+            id: planTaskId,
+            threadId: parentThreadId,
+            childThreadId: planChildThreadId,
+            title: "Check the plan",
+            status: "running",
+          }),
+          task({
+            id: foreignTaskId,
+            threadId: foreignThreadId,
+            childThreadId: ThreadId.make("thread:mcp-ids-foreign-child"),
+            title: "Foreign task",
+            status: "completed",
+          }),
+        ]);
+        const error = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.flatMap((service) =>
+            service.taskStatus(scope, NodeId.make("node:task-unknown-plan-check")),
+          ),
+          Effect.flip,
+          Effect.provide(layerWith(projection)),
+        );
+        assert.equal(error.code, "task_not_found");
+        assert.include(error.message, planTaskId);
+        assert.notInclude(error.message, foreignTaskId);
+        assert.notInclude(error.message, "Foreign task");
+      }),
+    );
+
+    it.effect("keeps the message bounded when the unknown id is very long", () =>
+      Effect.gen(function* () {
+        const projection = projectionWith([
+          task({
+            id: planTaskId,
+            threadId: parentThreadId,
+            childThreadId: planChildThreadId,
+            title: "Check the plan",
+            status: "running",
+          }),
+        ]);
+        const longId = NodeId.make(`node:${"x".repeat(5000)}`);
+        const error = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.flatMap((service) => service.taskStatus(scope, longId)),
+          Effect.flip,
+          Effect.provide(layerWith(projection)),
+        );
+        assert.equal(error.code, "task_not_found");
+        assert.isBelow(error.message.length, 1200);
+        assert.include(error.message, planTaskId);
+        assert.isFalse(error.message.includes(longId));
+      }),
+    );
+
+    it.effect("says a task that has no child thread yet has nothing to read", () =>
+      Effect.gen(function* () {
+        const projection = projectionWith([
+          {
+            ...task({
+              id: planTaskId,
+              threadId: parentThreadId,
+              childThreadId: planChildThreadId,
+              title: "Check the plan",
+              status: "running",
+            }),
+            childThreadId: null,
+          },
+        ]);
+        const error = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.flatMap((service) => service.taskStatus(scope, planTaskId)),
+          Effect.flip,
+          Effect.provide(layerWith(projection)),
+        );
+        assert.equal(error.code, "task_not_found");
+        assert.include(error.message, "has not started a child thread yet");
+        assert.notInclude(error.message, "is not an app-owned task");
+        assert.include(error.message, planTaskId);
+      }),
+    );
+
+    it.effect("counts the tasks it could not list instead of clipping them", () =>
+      Effect.gen(function* () {
+        const projection = projectionWith(
+          Array.from({ length: 30 }, (_, index) =>
+            task({
+              id: NodeId.make(`node:task-filler-${String(index).padStart(2, "0")}`),
+              threadId: parentThreadId,
+              childThreadId: ThreadId.make(`thread:mcp-ids-filler-${index}`),
+              title: `Filler ${index} ${"t".repeat(60)}`,
+              status: "completed",
+            }),
+          ),
+        );
+        const error = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.flatMap((service) =>
+            service.taskStatus(scope, NodeId.make("node:task-unknown-plan-check")),
+          ),
+          Effect.flip,
+          Effect.provide(layerWith(projection)),
+        );
+        assert.equal(error.code, "task_not_found");
+        assert.isBelow(error.message.length, 1200);
+        assert.match(error.message, /\(\+\d+ more\)$/);
+        assert.include(error.message, "node:task-filler-00");
+        assert.notInclude(error.message, "node:task-filler-29");
+        const omitted = /\(\+(\d+) more\)$/.exec(error.message)?.[1];
+        const shown = error.message.match(/node:task-filler-\d\d/g) ?? [];
+        assert.equal(Number(omitted) + shown.length, 30);
+      }),
+    );
+
+    it.effect("points a thread_not_found read at verbatim ids and task_status for node ids", () =>
+      Effect.gen(function* () {
+        const projection = projectionWith([]);
+        const decodedId = ThreadId.make("node:task-adly-plan-check");
+        const error = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.flatMap((service) => service.readThread(scope, { threadId: decodedId })),
+          Effect.flip,
+          Effect.provide(layerWith(projection)),
+        );
+        assert.equal(error.code, "thread_not_found");
+        assert.isTrue(error.message.startsWith(`Thread ${decodedId} is no longer available.`));
+        assert.include(error.message, "do not decode or re-encode");
+        assert.include(error.message, "not a thread id");
+        assert.include(error.message, "task_status");
+      }),
+    );
+  });
 });
 
 describe("OrchestratorMcpService provider resolution", () => {

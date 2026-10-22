@@ -123,6 +123,8 @@ const TASK_WAKE_EVENTS = [
 ] as const;
 const SECRET_REQUEST_POLL_INTERVAL_MS = 500;
 const DEFAULT_THREAD_LIST_LIMIT = 50;
+/** Ids have no length limit; an error message that echoes one still has to stay readable. */
+const shortOpaqueId = (id: string): string => (id.length > 160 ? `${id.slice(0, 157)}...` : id);
 const DEFAULT_THREAD_READ_LIMIT = 50;
 const DEFAULT_THREAD_RUN_LIMIT = 10;
 const DEFAULT_THREAD_ITEM_MAX_CHARS = 20_000;
@@ -1284,7 +1286,7 @@ const make = Effect.gen(function* () {
       return yield* threadNotFound(
         threadManagement,
         threadId,
-        `Thread ${threadId} is no longer available.`,
+        `Thread ${shortOpaqueId(threadId)} is no longer available. Pass thread ids exactly as returned; do not decode or re-encode them, because percent escapes are part of the id. A delegated task id is a node id, not a thread id - use task_status with it.`,
       );
     }
     const target = yield* threadManagement
@@ -1506,10 +1508,44 @@ const make = Effect.gen(function* () {
         candidate.threadId === scope.thread.threadId,
     );
     if (task === undefined || task.childThreadId === null) {
-      return yield* failure(
-        "task_not_found",
-        `Delegated task ${taskId} does not belong to thread ${scope.thread.threadId}.`,
-      );
+      const appOwnedTasks = parentProjection.subagents
+        .filter(
+          (candidate) =>
+            candidate.origin === "app_owned" && candidate.threadId === scope.thread.threadId,
+        )
+        .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+        .map(
+          (candidate) => `${candidate.id} (${candidate.title ?? "untitled"}, ${candidate.status})`,
+        );
+      const summaryBudget = 1200;
+      const opaqueNote =
+        "Task ids are opaque: pass one unchanged from delegate_task or a completion notice, and do not decode or re-encode it.";
+      const prefix = `${
+        task === undefined
+          ? `Task ${shortOpaqueId(taskId)} is not an app-owned task of this thread.`
+          : `Task ${shortOpaqueId(taskId)} has not started a child thread yet, so there is no result to read.`
+      } ${opaqueNote} App-owned tasks in this thread (id (title, status)): `;
+      const available = summaryBudget - prefix.length;
+      // Room for the "(+N more)" tail, so a full list plus the count stays inside
+      // the budget. Entries are never clipped: a caller must be able to pass an id
+      // back verbatim, so the list stops at the last entry that fits.
+      // " (+" + digits + " more)" is 9 characters plus the digits.
+      const reserve = String(appOwnedTasks.length).length + 9;
+      const listed: Array<string> = [];
+      let listedLength = 0;
+      for (const entry of appOwnedTasks) {
+        const added = entry.length + (listed.length === 0 ? 0 : 2);
+        if (listedLength + added + reserve > available) break;
+        listed.push(entry);
+        listedLength += added;
+      }
+      const omitted = appOwnedTasks.length - listed.length;
+      const shown = listed.join(", ");
+      const taskList =
+        appOwnedTasks.length === 0
+          ? "none"
+          : `${shown === "" ? "none shown" : shown}${omitted === 0 ? "" : ` (+${omitted} more)`}`;
+      return yield* failure("task_not_found", `${prefix}${taskList}`);
     }
     const childControls = yield* threadManagement
       .getThreadRecords(
