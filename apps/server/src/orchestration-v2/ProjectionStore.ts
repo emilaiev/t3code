@@ -191,6 +191,7 @@ export type ProjectionSettlementCandidate = Pick<
   | "branchPullRequest"
   | "createdAt"
   | "updatedAt"
+  | "lineage"
   | "archivedAt"
   | "settledOverride"
   | "pinnedAt"

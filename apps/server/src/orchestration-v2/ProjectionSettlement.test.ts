@@ -20,9 +20,59 @@ import * as Layer from "effect/Layer";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
-import { isAutoSettlementCandidate, resolveAutoSettlementAt } from "./ThreadSettlementService.ts";
+import {
+  DELEGATED_SETTLE_IDLE_MS,
+  isAutoSettlementCandidate,
+  resolveAutoSettlementAt,
+  shouldSettleDelegatedThread,
+} from "./ThreadSettlementService.ts";
 
 const layerSql = ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemory));
+
+it.effect("settles delegated children once idle, without sidebar auto-settle settings", () =>
+  Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const nowMs = DateTime.toEpochMillis(now);
+    const parent = yield* createThread("delegated-parent");
+    const lineage = {
+      parentThreadId: parent,
+      relationshipToParent: "subagent" as const,
+      rootThreadId: parent,
+    };
+    const idleChild = yield* createThread("delegated-idle", { lineage });
+    yield* createRun(idleChild, "completed");
+    const activeChild = yield* createThread("delegated-active", { lineage });
+    yield* createRun(activeChild, "running");
+    const snoozedChild = yield* createThread("delegated-snoozed", {
+      lineage,
+      snoozedUntil: DateTime.add(now, { hours: 1 }),
+    });
+    yield* createRun(snoozedChild, "completed");
+    const optedOutChild = yield* createThread("delegated-opted-out", {
+      lineage,
+      autoSettleDisabledAt: old,
+    });
+    yield* createRun(optedOutChild, "completed");
+    const freshChild = yield* createThread("delegated-fresh", {
+      lineage,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const operator = yield* createThread("operator-idle");
+    yield* createRun(operator, "completed");
+    const candidates = yield* store.getSettlementCandidates();
+    const eligible = new Set(
+      candidates
+        .filter((thread) => shouldSettleDelegatedThread(thread, nowMs))
+        .map((thread) => thread.id),
+    );
+    assert.deepEqual(eligible, new Set([idleChild]));
+    assert.isTrue(DELEGATED_SETTLE_IDLE_MS <= 60_000);
+    const freshCandidate = candidates.find((thread) => thread.id === freshChild)!;
+    assert.isFalse(shouldSettleDelegatedThread(freshCandidate, nowMs));
+    assert.isTrue(shouldSettleDelegatedThread(freshCandidate, nowMs + DELEGATED_SETTLE_IDLE_MS));
+  }).pipe(Effect.provide(layerSql)),
+);
 const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
 const old = DateTime.subtract(now, { days: 10 });
 const providerInstanceId = ProviderInstanceId.make("codex");

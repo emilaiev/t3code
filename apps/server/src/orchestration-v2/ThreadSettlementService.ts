@@ -174,6 +174,29 @@ export function isAutoSettlementCandidate(
  * Server twin of the client's `effectiveSnoozed`, so agents and the sidebar agree on what is
  * snoozed.
  */
+/**
+ * Delegated child threads are subagent conversations rather than the operator's own work.
+ * They settle once their work is done, independently of the sidebar auto-settle settings,
+ * because settlement is reversible: a follow-up message reopens the thread.
+ */
+export const DELEGATED_SETTLE_IDLE_MS = 60_000;
+
+export function shouldSettleDelegatedThread(
+  thread: ProjectionStore.ProjectionSettlementCandidate,
+  nowMs: number,
+): boolean {
+  if (thread.lineage.relationshipToParent !== "subagent") return false;
+  if (!isAutoSettlementCandidate(thread, nowMs)) return false;
+  const activityAtMs =
+    latestMillis([
+      toMillis(thread.latestUserMessageAt),
+      toMillis(thread.latestRunRequestedAt),
+      toMillis(thread.latestRunStartedAt),
+      toMillis(thread.latestRunCompletedAt),
+    ]) ?? toMillis(thread.createdAt);
+  return activityAtMs !== null && nowMs - activityAtMs >= DELEGATED_SETTLE_IDLE_MS;
+}
+
 export function isSnoozed(
   thread: Pick<
     ProjectionStore.ProjectionSettlementCandidate,
@@ -303,24 +326,56 @@ export const make = Effect.gen(function* () {
   // so this keeps the settle action to one run per settlement.
   const settleActionRunAt = new Map<ThreadId, number>();
 
+  const settleDelegatedThreads = Effect.fn("ThreadSettlementServiceV2.settleDelegatedThreads")(
+    function* (delegated: ReadonlyArray<ProjectionStore.ProjectionSettlementCandidate>) {
+      yield* Effect.forEach(
+        delegated,
+        (thread) =>
+          Effect.gen(function* () {
+            const uuid = yield* crypto.randomUUIDv4();
+            yield* orchestrator.dispatch({
+              type: "thread.auto-settle",
+              commandId: CommandId.make(`server:delegated-settle:${thread.id}:${uuid}`),
+              threadId: thread.id,
+              snapshotAt: thread.updatedAt,
+              settledAt: thread.updatedAt,
+            });
+          }).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("delegated thread settlement skipped", {
+                threadId: thread.id,
+                cause: Cause.pretty(cause),
+              }),
+            ),
+          ),
+        { concurrency: 4, discard: true },
+      );
+    },
+  );
+
   const sweep = Effect.fn("ThreadSettlementServiceV2.sweep")(function* (
     mergedPullRequest: PullRequestService.PullRequestMergeEvent | null,
     threadId?: ThreadId,
   ) {
     const settings = yield* settingsService.getSettings;
+    const threads = yield* projections.getSettlementCandidates(threadId);
+    if (threads.length === 0) return;
+    const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+    const candidates = threads.filter((thread) => isAutoSettlementCandidate(thread, nowMs));
+    // Delegated children leave the active list as soon as their work is done,
+    // whether or not the operator configured sidebar auto-settlement.
+    yield* settleDelegatedThreads(
+      candidates.filter((thread) => shouldSettleDelegatedThread(thread, nowMs)),
+    );
     if (!autoSettlementConfigured(settings)) {
       return;
     }
-    const threads = yield* projections.getSettlementCandidates(threadId);
-    if (threads.length === 0) return;
     const projectShells = yield* projectStore.listShells();
-    const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
     const projects = new Map(projectShells.map((project) => [project.id, project]));
     // A merge event re-sweeps every candidate, not just the threads linked to
     // the merged pull request: most threads carry no link and settle from
     // their branch lookup, which would otherwise wait for the next minute's
     // sweep on a possibly stale cached answer.
-    const candidates = threads.filter((thread) => isAutoSettlementCandidate(thread, nowMs));
 
     const settleThread = Effect.fn("ThreadSettlementServiceV2.settleThread")(
       function* (thread: (typeof candidates)[number], pullRequest: SettlementPullRequest | null) {
