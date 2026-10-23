@@ -58,6 +58,12 @@ it.effect("settles delegated children once idle, without sidebar auto-settle set
       createdAt: now,
       updatedAt: now,
     });
+    const alreadySettledChild = yield* createThread("delegated-already-settled", {
+      lineage,
+      settledOverride: "settled",
+      settledAt: old,
+    });
+    yield* createRun(alreadySettledChild, "completed");
     const operator = yield* createThread("operator-idle");
     yield* createRun(operator, "completed");
     const candidates = yield* store.getSettlementCandidates();
@@ -66,11 +72,21 @@ it.effect("settles delegated children once idle, without sidebar auto-settle set
         .filter((thread) => shouldSettleDelegatedThread(thread, nowMs))
         .map((thread) => thread.id),
     );
+    assert.isFalse(candidates.some((thread) => thread.id === alreadySettledChild));
     assert.deepEqual(eligible, new Set([idleChild]));
-    assert.isTrue(DELEGATED_SETTLE_IDLE_MS <= 60_000);
     const freshCandidate = candidates.find((thread) => thread.id === freshChild)!;
     assert.isFalse(shouldSettleDelegatedThread(freshCandidate, nowMs));
     assert.isTrue(shouldSettleDelegatedThread(freshCandidate, nowMs + DELEGATED_SETTLE_IDLE_MS));
+    const withRequest = {
+      ...freshCandidate,
+      pendingRuntimeRequest: { requestId: "request:test" },
+    } as unknown as ProjectionStore.ProjectionSettlementCandidate;
+    assert.isFalse(shouldSettleDelegatedThread(withRequest, nowMs + DELEGATED_SETTLE_IDLE_MS));
+    const withBackground = {
+      ...freshCandidate,
+      pendingBackgroundTasks: [{ kind: "subagent" }],
+    } as unknown as ProjectionStore.ProjectionSettlementCandidate;
+    assert.isFalse(shouldSettleDelegatedThread(withBackground, nowMs + DELEGATED_SETTLE_IDLE_MS));
   }).pipe(Effect.provide(layerSql)),
 );
 const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");

@@ -362,14 +362,18 @@ export const make = Effect.gen(function* () {
     if (threads.length === 0) return;
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
     const candidates = threads.filter((thread) => isAutoSettlementCandidate(thread, nowMs));
+    const delegated = candidates.filter((thread) => shouldSettleDelegatedThread(thread, nowMs));
     // Delegated children leave the active list as soon as their work is done,
     // whether or not the operator configured sidebar auto-settlement.
-    yield* settleDelegatedThreads(
-      candidates.filter((thread) => shouldSettleDelegatedThread(thread, nowMs)),
-    );
+    yield* settleDelegatedThreads(delegated);
     if (!autoSettlementConfigured(settings)) {
       return;
     }
+    // The delegated pass owns subagent threads; the settings pass owns the
+    // operator's own threads, including any pull-request settlement.
+    const operatorCandidates = candidates.filter(
+      (thread) => thread.lineage.relationshipToParent !== "subagent",
+    );
     const projectShells = yield* projectStore.listShells();
     const projects = new Map(projectShells.map((project) => [project.id, project]));
     // A merge event re-sweeps every candidate, not just the threads linked to
@@ -378,7 +382,10 @@ export const make = Effect.gen(function* () {
     // sweep on a possibly stale cached answer.
 
     const settleThread = Effect.fn("ThreadSettlementServiceV2.settleThread")(
-      function* (thread: (typeof candidates)[number], pullRequest: SettlementPullRequest | null) {
+      function* (
+        thread: (typeof operatorCandidates)[number],
+        pullRequest: SettlementPullRequest | null,
+      ) {
         const currentSettings = resolveProjectSettings(
           yield* settingsService.getSettings,
           thread.projectId,
@@ -417,7 +424,7 @@ export const make = Effect.gen(function* () {
     );
 
     const lookupCandidates = (yield* Effect.forEach(
-      candidates,
+      operatorCandidates,
       (thread) => settleThread(thread, null),
       { concurrency: 8 },
     ))
@@ -606,6 +613,10 @@ export const make = Effect.gen(function* () {
       const settled = yield* projections.getThread(threadId);
       if (settled.settledOverride !== "settled") return;
       yield* terminals.closeIdle({ threadId });
+      // A delegated child keeps its worktree for a possible follow-up, so the
+      // project's settle script, which may clean or remove it, runs only for
+      // the operator's own threads.
+      if (settled.lineage.relationshipToParent === "subagent") return;
       const worktreePath = settled.worktreePath;
       if (worktreePath === null || !(yield* fileSystem.exists(worktreePath))) return;
       // Closing and the worktree check wait on I/O. A thread re-engaged
