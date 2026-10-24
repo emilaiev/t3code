@@ -4431,7 +4431,6 @@ const providerTurnId = Effect.gen(function* () {
   });
 }).pipe(Effect.provide(IdAllocator.layer));
 it.layer(McpProviderSessions.layer)("OpenCode native context accounting", (it) => {
-
   it.effect("counts every wire byte of the active context, including fields this build drops", () =>
     Effect.gen(function* () {
       // A 2.0.32 server can carry fields 2.0.28 does not decode; only the raw

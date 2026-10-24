@@ -2781,20 +2781,26 @@ describe("OrchestratorMcpService thread lookup", () => {
     }),
   );
 
-  it.effect("keeps the plain message for an id that matches nothing", () =>
-    Effect.gen(function* () {
-      const { read, send } = yield* failuresFor([]);
-      assert.equal(read.code, "thread_not_found");
-      assert.equal(read.message, `Thread ${bareId} is no longer available.`);
-      assert.equal(send.code, "thread_not_found");
-      assert.equal(send.message, `Thread ${bareId} was not found.`);
-    }),
+  it.effect(
+    "keeps recovery guidance without a suggested thread for an id that matches nothing",
+    () =>
+      Effect.gen(function* () {
+        const { read, send } = yield* failuresFor([]);
+        assert.equal(read.code, "thread_not_found");
+        assert.include(read.message, `Thread ${bareId} is no longer available.`);
+        assert.include(read.message, "Pass thread ids exactly as returned");
+        assert.notInclude(read.message, `mcp:${bareId}`);
+        assert.equal(send.code, "thread_not_found");
+        assert.equal(send.message, `Thread ${bareId} was not found.`);
+      }),
   );
 
   it.effect("does not name an mcp: thread that was deleted", () =>
     Effect.gen(function* () {
       const { read, send } = yield* failuresFor([deletedLaunched]);
-      assert.equal(read.message, `Thread ${bareId} is no longer available.`);
+      assert.include(read.message, `Thread ${bareId} is no longer available.`);
+      assert.include(read.message, "Pass thread ids exactly as returned");
+      assert.notInclude(read.message, `mcp:${bareId}`);
       assert.equal(send.message, `Thread ${bareId} was not found.`);
     }),
   );
