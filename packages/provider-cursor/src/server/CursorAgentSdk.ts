@@ -197,6 +197,16 @@ export type CursorAgentSdkProtocolLogEvent =
       };
     }
   | {
+      readonly direction: "incoming";
+      readonly stage: "decoded";
+      readonly payload: {
+        readonly type: "agent.runs.scan";
+        readonly agentId: string;
+        readonly runCount: number;
+        readonly activeRunId?: string;
+      };
+    }
+  | {
       readonly direction: "outgoing";
       readonly stage: "decoded";
       readonly payload: {
@@ -235,6 +245,9 @@ function runnerError(cause: unknown, method: string): CursorAgentSdkRunnerError 
 function isActiveRunConflict(cause: unknown): boolean {
   return cause instanceof Error && /already has active run/i.test(cause.message);
 }
+
+/** Bounds the abandoned-run scan; the SDK returns one page unless a cursor says otherwise. */
+const ABANDONED_RUN_MAX_SCAN_PAGES = 50;
 
 export function isCursorCancellationError(cause: unknown): boolean {
   let current = cause;
@@ -466,19 +479,57 @@ export const makeCursorAgentSdkRunner = Effect.fn("makeCursorAgentSdkRunner")(fu
                 }),
               catch: (cause) => runnerError(cause, "run.start"),
             });
+          // The SDK lists runs oldest first, so asking for the first page finds the
+          // first turn rather than the run still marked active. The abandoned run
+          // that blocks a resumed send can sit anywhere in the list: page through
+          // until it is found, and record what the scan saw either way.
+          const findAbandonedRun = Effect.gen(function* () {
+            let cursor: string | undefined;
+            let runCount = 0;
+            for (let page = 0; page < ABANDONED_RUN_MAX_SCAN_PAGES; page += 1) {
+              const listing = yield* Effect.tryPromise({
+                try: () =>
+                  Agent.listRuns(agent.agentId, {
+                    ...runOptions,
+                    ...(cursor === undefined ? {} : { cursor }),
+                  }),
+                catch: (cause) => runnerError(cause, "agent.listRuns"),
+              });
+              runCount += listing.items.length;
+              const activeRun = listing.items.find((candidate) => candidate.status === "running");
+              if (activeRun !== undefined) {
+                yield* log({
+                  direction: "incoming",
+                  stage: "decoded",
+                  payload: {
+                    type: "agent.runs.scan",
+                    agentId: agent.agentId,
+                    runCount,
+                    activeRunId: activeRun.id,
+                  },
+                });
+                return activeRun;
+              }
+              if (listing.nextCursor === undefined) {
+                break;
+              }
+              cursor = listing.nextCursor;
+            }
+            yield* log({
+              direction: "incoming",
+              stage: "decoded",
+              payload: { type: "agent.runs.scan", agentId: agent.agentId, runCount },
+            });
+            return undefined;
+          });
+
           const run = yield* startRun().pipe(
             Effect.catchIf(
               (error) => abandonedRunRecoveryAvailable && isActiveRunConflict(error.cause),
               (error) =>
                 Effect.gen(function* () {
                   abandonedRunRecoveryAvailable = false;
-                  const latestRun = yield* Effect.tryPromise({
-                    try: () => Agent.listRuns(agent.agentId, { ...runOptions, limit: 1 }),
-                    catch: (cause) => runnerError(cause, "agent.listRuns"),
-                  });
-                  const activeRun = latestRun.items.find(
-                    (candidate) => candidate.status === "running",
-                  );
+                  const activeRun = yield* findAbandonedRun;
                   if (activeRun === undefined) {
                     return yield* error;
                   }

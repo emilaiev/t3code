@@ -14,6 +14,7 @@ const cursorSdkMock = vi.hoisted(() => {
   const runOperations: Array<string> = [];
   let agentCloseFailure: unknown;
   let staleRunActive = false;
+  let listRunsPageSize: number | undefined;
   const runWait = vi.fn(async () => ({
     id: "run-cursor-agent-sdk-test",
     requestId: "request-cursor-agent-sdk-test",
@@ -62,12 +63,35 @@ const cursorSdkMock = vi.hoisted(() => {
     send,
     close: agentClose,
   }));
-  const listRuns = vi.fn(async () => {
-    runOperations.push("agent.listRuns");
-    return {
-      items: staleRunActive ? [{ id: "run-stale", status: "running" }] : [],
-    };
-  });
+  // Mirrors the real SDK: runs come back oldest first, and a limit truncates the
+  // page instead of selecting the newest run.
+  const listRuns = vi.fn(
+    async (
+      _agentId: string,
+      options?: {
+        readonly limit?: number;
+        readonly cursor?: string;
+        readonly runtime?: "local";
+        readonly cwd?: string;
+      },
+    ) => {
+      runOperations.push("agent.listRuns");
+      const items = staleRunActive
+        ? [
+            { id: "run-cursor-agent-sdk-test-earlier", status: "finished" },
+            { id: "run-stale", status: "running" },
+          ]
+        : [];
+      const offset = options?.cursor === undefined ? 0 : Number(options.cursor);
+      const pageSize = listRunsPageSize ?? options?.limit ?? items.length;
+      const page = items.slice(offset, offset + pageSize);
+      const nextOffset = offset + page.length;
+      return {
+        items: page,
+        ...(nextOffset < items.length ? { nextCursor: String(nextOffset) } : {}),
+      };
+    },
+  );
   const cancelRun = vi.fn(async () => {
     runOperations.push("agent.cancelRun");
     staleRunActive = false;
@@ -86,6 +110,9 @@ const cursorSdkMock = vi.hoisted(() => {
     send,
     setAgentCloseFailure: (failure: unknown) => {
       agentCloseFailure = failure;
+    },
+    setListRunsPageSize: (size: number | undefined) => {
+      listRunsPageSize = size;
     },
     setStaleRunActive: (active: boolean) => {
       staleRunActive = active;
@@ -161,7 +188,7 @@ describe("CursorAgentSdkRunner", () => {
       ]);
       assert.deepStrictEqual(cursorSdkMock.listRuns.mock.calls[0], [
         "agent-cursor-agent-sdk-test",
-        { runtime: "local", cwd: process.cwd(), limit: 1 },
+        { runtime: "local", cwd: process.cwd() },
       ]);
       assert.deepStrictEqual(cursorSdkMock.cancelRun.mock.calls[0], [
         "run-stale",
@@ -170,6 +197,38 @@ describe("CursorAgentSdkRunner", () => {
           cwd: process.cwd(),
         },
       ]);
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("finds the abandoned run when the store pages the run list", () =>
+    Effect.gen(function* () {
+      cursorSdkMock.runOperations.length = 0;
+      cursorSdkMock.listRuns.mockClear();
+      cursorSdkMock.cancelRun.mockClear();
+      cursorSdkMock.setStaleRunActive(true);
+      cursorSdkMock.setListRunsPageSize(1);
+
+      const runner = yield* CursorAgentSdk.CursorAgentSdkRunner;
+      const session = yield* runner.open({
+        operation: "resume",
+        agentId: "agent-cursor-agent-sdk-test",
+        options: { model: { id: "default" }, mode: "agent", local: { cwd: process.cwd() } },
+        threadId: ThreadId.make("thread-cursor-agent-sdk-stale-run-paged-test"),
+        providerSessionId: ProviderSessionId.make(
+          "provider-session-cursor-agent-sdk-stale-run-paged-test",
+        ),
+      });
+      const run = yield* session.send({ message: "continue" });
+      yield* run.wait;
+
+      assert.deepStrictEqual(cursorSdkMock.runOperations, [
+        "run.start",
+        "agent.listRuns",
+        "agent.listRuns",
+        "agent.cancelRun",
+        "run.start",
+      ]);
+      cursorSdkMock.setListRunsPageSize(undefined);
     }).pipe(Effect.provide(layerTest)),
   );
 });
