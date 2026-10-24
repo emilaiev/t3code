@@ -3224,6 +3224,9 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
             pendingRuntimeRequest: null,
             limitRecovery: sqlShell.limitRecovery,
             snoozedUntil: sqlShell.snoozedUntil,
+            createdBy: sqlShell.createdBy,
+            creationSource: sqlShell.creationSource,
+            lineage: sqlShell.lineage,
           });
         } else assert.isUndefined(candidate);
         assert.isUndefined(candidates.find((row) => row.id === otherThreadId));

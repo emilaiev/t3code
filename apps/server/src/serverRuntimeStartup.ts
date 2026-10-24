@@ -315,6 +315,11 @@ const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
                 projectId: project.id,
                 operation: error.operation,
               }).pipe(Effect.as(undefined)),
+            ThreadLaunchModelClosedError: (error) =>
+              Effect.logInfo("Skipped bootstrap thread because its model is closed", {
+                projectId: project.id,
+                closedUntil: error.closedUntil,
+              }).pipe(Effect.as(undefined)),
           }),
         );
       bootstrapProjectId = project.id;

@@ -78,15 +78,16 @@ export function applyUsageLimitsUpdate(input: {
       changed = true;
     }
   }
-  if (!changed && previous !== undefined) {
+  const full = [...merged.values()].some((window) => window.usedPercent >= 100);
+  if (!changed && previous !== undefined && (!full || previous.checkedAt === input.checkedAt)) {
     return previous;
   }
-  const unavailable =
-    previous === undefined ? { reason: "probeFailed" as const } : previous.unavailable;
+  // A real window is a reading. Do not stamp probeFailed onto the first
+  // update, and do not keep an earlier probe failure over windows we just
+  // accepted. An unsupported account already returned above.
   return {
     ...makeUsageLimits({ checkedAt: input.checkedAt, windows: merged.values() }),
     ...(previous?.resetCredits !== undefined ? { resetCredits: previous.resetCredits } : {}),
-    ...(unavailable !== undefined ? { unavailable } : {}),
   };
 }
 

@@ -419,6 +419,9 @@ export const OrchestratorMcpThreadDetail = Schema.Struct({
   runCount: NonNegativeInt,
   itemCount: NonNegativeInt,
   pendingRequestCount: NonNegativeInt,
+  /** Present only when the thread's latest failure is a usage limit. */
+  lastErrorClass: Schema.optional(Schema.Literal("usage_limit")),
+  usageLimitResetAt: Schema.optional(Schema.NullOr(IsoDateTime)),
   archived: Schema.Boolean,
   settled: Schema.Boolean,
   settledAt: Schema.NullOr(IsoDateTime),
@@ -549,6 +552,8 @@ export const OrchestratorMcpProviderCapability = Schema.Struct({
       id: Schema.String,
       /** Omitted when it only restates the id. */
       label: Schema.optional(Schema.String),
+      /** Present only when this model cannot be started until this instant. */
+      closedUntil: Schema.optional(IsoDateTime),
       options: Schema.optional(Schema.Array(OrchestratorMcpModelOption)),
     }),
   ),
@@ -712,6 +717,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "parent_not_active",
       "provider_unavailable",
       "model_unavailable",
+      "model_closed",
       "runtime_mode_escalation_denied",
       "interaction_mode_escalation_denied",
       "task_not_found",

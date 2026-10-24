@@ -62,10 +62,32 @@ describe("applyUsageLimitsUpdate", () => {
     ).toBe(published);
   });
 
-  it("marks a first sparse update as unavailable", () => {
+  it("records a first sparse update as a real reading", () => {
     expect(
       applyUsageLimitsUpdate({ previous: undefined, checkedAt, update: { windows: [weekly] } }),
-    ).toEqual({ checkedAt, windows: [weekly], unavailable: { reason: "probeFailed" } });
+    ).toEqual({ checkedAt, windows: [weekly] });
+  });
+
+  it("refreshes the reading time when a full window is repeated", () => {
+    const full = {
+      ...session,
+      usedPercent: 100,
+    };
+    const previous = {
+      checkedAt,
+      windows: [full],
+      unavailable: { reason: "probeFailed" as const },
+    };
+    expect(
+      applyUsageLimitsUpdate({
+        previous,
+        checkedAt: "2026-09-03T12:00:05.000Z",
+        update: { windows: [full] },
+      }),
+    ).toEqual({
+      checkedAt: "2026-09-03T12:00:05.000Z",
+      windows: [full],
+    });
   });
 
   it("preserves reset credits when a streamed window update changes usage", () => {

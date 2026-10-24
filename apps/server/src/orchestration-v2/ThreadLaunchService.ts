@@ -41,6 +41,7 @@ import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
+import * as ModelQuotaGate from "../provider/modelQuotaGate.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
@@ -157,6 +158,15 @@ export class ThreadLaunchBaseRefError extends Schema.TaggedError<ThreadLaunchBas
   }
 }
 
+export class ThreadLaunchModelClosedError extends Schema.TaggedError<ThreadLaunchModelClosedError>()(
+  "ThreadLaunchModelClosedError",
+  { closedUntil: Schema.String },
+) {
+  override get message(): string {
+    return `closed until ${this.closedUntil}`;
+  }
+}
+
 export class ThreadLaunchService extends Context.Service<
   ThreadLaunchService,
   {
@@ -164,7 +174,9 @@ export class ThreadLaunchService extends Context.Service<
       input: ThreadLaunchInput,
     ) => Effect.Effect<
       ThreadLaunchResult,
-      ThreadLaunchError | ThreadManagement.ThreadManagementProviderInstanceDisabledError
+      | ThreadLaunchError
+      | ThreadLaunchModelClosedError
+      | ThreadManagement.ThreadManagementProviderInstanceDisabledError
     >;
     /**
      * `launch` accepts such a launch and reports the failure inside the
@@ -837,6 +849,18 @@ const make = Effect.gen(function* () {
       }
 
       const launchReceipt = yield* readReceipt(input, input.commandId);
+      const replayingAccepted =
+        Option.isSome(launchReceipt) && launchReceipt.value.status === "accepted";
+      if (!replayingAccepted) {
+        const closedUntil = yield* ModelQuotaGate.modelClosure(
+          providerRegistry,
+          input.modelSelection.instanceId,
+          input.modelSelection.model,
+        );
+        if (closedUntil !== undefined) {
+          return yield* new ThreadLaunchModelClosedError({ closedUntil });
+        }
+      }
       yield* threads.assertProviderInstanceEnabled({
         projectId: input.projectId,
         commandId: input.commandId,

@@ -65,6 +65,7 @@ import {
   ThreadId,
   isOrchestrationV2WorkActive,
 } from "@t3tools/contracts";
+import { modelClosedUntil } from "@t3tools/shared/modelQuotaClosure";
 import { getProviderOptionCurrentValue } from "@t3tools/shared/model";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import {
@@ -100,6 +101,7 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import { isSnoozed } from "../orchestration-v2/ThreadSettlementService.ts";
 import { userFacingDispatchErrorMessage } from "../orchestration-v2/UserFacingErrors.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as ModelQuotaGate from "../provider/modelQuotaGate.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -926,6 +928,12 @@ function threadDetail(
     pendingRequestCount: projection.runtimeRequests.filter(
       (request) => request.status === "pending",
     ).length,
+    ...(shell.lastErrorClass === "usage_limit"
+      ? {
+          lastErrorClass: "usage_limit" as const,
+          usageLimitResetAt: shell.usageLimitResetAt ?? null,
+        }
+      : {}),
     archived: projection.thread.archivedAt !== null,
     ...threadSettlement(projection.thread),
     ...threadSnooze(shell, nowMs),
@@ -1300,6 +1308,15 @@ const make = Effect.gen(function* () {
   });
 
   const loadProviders = providerRegistry.getProviders;
+
+  const refuseClosedModel = (instanceId: ProviderInstanceId, modelId: string) =>
+    ModelQuotaGate.modelClosure(providerRegistry, instanceId, modelId).pipe(
+      Effect.flatMap((closedUntil) =>
+        closedUntil === undefined
+          ? Effect.void
+          : Effect.fail(failure("model_closed", `closed until ${closedUntil}`)),
+      ),
+    );
 
   const loadOrchestrationCapableInstanceIds = () =>
     providerAdapters.list().pipe(Effect.map((instanceIds) => new Set(instanceIds)));
@@ -2118,6 +2135,7 @@ const make = Effect.gen(function* () {
       );
       const inherited = parent?.thread.modelSelection;
       const searchTerms = input.search?.toLowerCase().split(/\s+/) ?? [];
+      const nowMs = yield* DateTime.now.pipe(Effect.map(DateTime.toEpochMillis));
       return {
         parentThreadId: parent?.thread.id ?? null,
         inheritedProviderInstanceId: inherited?.instanceId ?? null,
@@ -2130,6 +2148,13 @@ const make = Effect.gen(function* () {
             provider,
             orchestrationCapableInstanceIds.has(provider.instanceId),
           );
+          const closedFor = (modelId: string) =>
+            modelClosedUntil({
+              driver: provider.driver,
+              modelId,
+              limits: provider.usageLimits,
+              nowMs,
+            });
           const { listed, omitted } = listCapabilityModels({
             provider,
             preferences: settings.providerModelPreferences?.[provider.instanceId],
@@ -2148,11 +2173,13 @@ const make = Effect.gen(function* () {
             displayName: provider.displayName ?? null,
             models: listed.map((model) => {
               const options = model.capabilities?.optionDescriptors ?? [];
+              const closedUntil = closedFor(model.slug);
               return {
                 id: model.slug,
                 ...(model.name.toLowerCase() === model.slug.toLowerCase()
                   ? {}
                   : { label: model.name }),
+                ...(closedUntil === undefined ? {} : { closedUntil }),
                 ...(options.length === 0 ? {} : { options: options.map(capabilityModelOption) }),
               };
             }),
@@ -2207,6 +2234,9 @@ const make = Effect.gen(function* () {
         providers,
         skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
       });
+      if (!isRetryOfAcceptedDelegation) {
+        yield* refuseClosedModel(target.modelSelection.instanceId, target.modelSelection.model);
+      }
       const runtimeMode = yield* resolveRuntimeMode(
         parent.thread.runtimeMode,
         input.runtimeMode,
@@ -2612,6 +2642,12 @@ const make = Effect.gen(function* () {
                 parent.thread.interactionMode,
                 request.interactionMode,
               );
+              if (!isRetryOfAcceptedCreation) {
+                yield* refuseClosedModel(
+                  target.modelSelection.instanceId,
+                  target.modelSelection.model,
+                );
+              }
               yield* assertTargetEnabledForProject(parent, commandId, target);
               const title = threadTitle({
                 parentTitle: parent.thread.title,

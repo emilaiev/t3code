@@ -21,7 +21,8 @@ export function limitRecoveryCommand(
     !thread.usageLimitResetAt ||
     thread.archivedAt !== null ||
     thread.settledOverride === "settled" ||
-    thread.pendingRuntimeRequest !== null
+    thread.pendingRuntimeRequest !== null ||
+    isTopLevelMcpLaunch(thread)
   )
     return null;
   const resetMs = Date.parse(thread.usageLimitResetAt);
@@ -69,6 +70,20 @@ export function limitRecoveryCommand(
     createdBy: "user",
     creationSource: "server",
   };
+}
+
+/** A t3x run is a top-level thread an agent started through MCP. On a server that includes this rule, detach and a timed-out wait leave nobody to settle it, so it is not resumed. The signed Mac app does not include this rule. A subagent still follows the normal recovery rule. */
+function isTopLevelMcpLaunch(
+  thread: Pick<
+    ProjectionStore.ProjectionLimitRecoveryCandidate,
+    "createdBy" | "creationSource" | "lineage"
+  >,
+): boolean {
+  return (
+    thread.createdBy === "agent" &&
+    thread.creationSource === "mcp" &&
+    thread.lineage.relationshipToParent === null
+  );
 }
 
 const makeSweep = Effect.gen(function* () {

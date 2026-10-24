@@ -173,6 +173,9 @@ export type ProjectionLimitRecoveryCandidate = Pick<
   | "updatedAt"
   | "limitRecovery"
   | "snoozedUntil"
+  | "createdBy"
+  | "creationSource"
+  | "lineage"
 >;
 
 export type ProjectionThreadPullRequests = Pick<
@@ -3847,6 +3850,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               SELECT 1 FROM orchestration_v2_projection_runtime_requests request
               WHERE request.thread_id = t.thread_id AND request.status = 'pending'
             )
+            -- A top-level thread an agent started through MCP is a t3x run.
+            -- Nothing is waiting to settle it after detach or a timed-out wait,
+            -- so the sweep must not resume that brief when the limit resets.
+            AND NOT (
+              json_extract(t.payload_json, '$.createdBy') = 'agent'
+              AND json_extract(t.payload_json, '$.creationSource') = 'mcp'
+              AND json_extract(t.payload_json, '$.lineage.relationshipToParent') IS NULL
+            )
           ORDER BY t.thread_id
         `;
         const candidates: Array<ProjectionLimitRecoveryCandidate> = [];
@@ -3872,6 +3883,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             pendingRuntimeRequest: null,
             limitRecovery: thread.limitRecovery ?? null,
             snoozedUntil: thread.snoozedUntil ?? null,
+            createdBy: thread.createdBy,
+            creationSource: thread.creationSource,
+            lineage: thread.lineage,
           });
         }
         return candidates;

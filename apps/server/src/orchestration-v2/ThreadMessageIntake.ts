@@ -222,7 +222,10 @@ export const launchThread = Effect.fn("ThreadMessageIntake.launchThread")(functi
         ),
       ),
       Effect.tapError((error) => {
-        if (error._tag === "ThreadManagementProviderInstanceDisabledError") {
+        if (
+          error._tag === "ThreadManagementProviderInstanceDisabledError" ||
+          error._tag === "ThreadLaunchModelClosedError"
+        ) {
           return AttachmentClaims.releaseClaimedAttachments(claimed.claimedPaths);
         }
         // Project/receipt reads precede message dispatch. The create-thread error

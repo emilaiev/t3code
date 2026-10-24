@@ -181,6 +181,12 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           creationSource: "mcp",
         }).pipe(
           Effect.mapError((error) => {
+            if (error._tag === "ThreadLaunchModelClosedError") {
+              return new OrchestratorMcpFailure({
+                code: "model_closed",
+                message: error.message,
+              });
+            }
             if (error._tag === "AttachmentClaimError") {
               return new OrchestratorMcpFailure({
                 code: "orchestration_error",
