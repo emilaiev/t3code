@@ -143,4 +143,22 @@ describe("resolveUsageLimitsAfterProbe", () => {
     expect(resolveUsageLimitsAfterProbe({ published, probed: unsupported })).toBe(unsupported);
     expect(resolveUsageLimitsAfterProbe({ published: undefined, probed: failed })).toBe(failed);
   });
+
+  it("drops last good windows when the failed probe cannot prove the same account", () => {
+    const known = { ...published, credentialFingerprint: "account-a" };
+    const failed = { checkedAt, windows: [], unavailable: { reason: "probeFailed" as const } };
+    expect(resolveUsageLimitsAfterProbe({ published: known, probed: failed })).toBe(failed);
+    expect(
+      resolveUsageLimitsAfterProbe({
+        published: known,
+        probed: { ...failed, credentialFingerprint: "account-b" },
+      }),
+    ).toMatchObject({ credentialFingerprint: "account-b" });
+    expect(
+      resolveUsageLimitsAfterProbe({
+        published: known,
+        probed: { ...failed, credentialFingerprint: "account-a" },
+      }),
+    ).toBe(known);
+  });
 });

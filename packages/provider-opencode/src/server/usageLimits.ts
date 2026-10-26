@@ -41,9 +41,19 @@ const UsageResponse = Schema.Struct({
   usage: Schema.Struct({ rolling: UsageWindow, weekly: UsageWindow, monthly: UsageWindow }),
 });
 
-// Select before decoding so an OAuth or self-hosted connection cannot fall
-// through to another stored account. NULL-active rows predate the selection flag.
-const readConsoleApiKey = (databasePath: string) =>
+// A missing row and an unreadable database both yield "no key here", but only
+// the first may fall through to another account: a read failure is not
+// evidence that this account has no credential.
+type StoredKeyRead =
+  | { readonly _tag: "key"; readonly key: string }
+  | { readonly _tag: "missing" }
+  | { readonly _tag: "unreadable" };
+
+// OpenCode 2 tags the Console connection "opencode" and a local Go login
+// "opencode-go"; either can hold the key this probe needs. Select before
+// decoding so an OAuth or self-hosted connection cannot fall through to
+// another stored account. NULL-active rows predate the selection flag.
+const readStoredApiKey = (databasePath: string, integrationId: "opencode" | "opencode-go") =>
   Effect.try(() => {
     const database = new NodeSqlite.DatabaseSync(databasePath, { readOnly: true });
     try {
@@ -51,10 +61,10 @@ const readConsoleApiKey = (databasePath: string) =>
       const row = database
         .prepare(
           `SELECT value FROM credential
-           WHERE integration_id = 'opencode' AND active IS NOT 0
+           WHERE integration_id = ? AND active IS NOT 0
            ORDER BY active DESC, time_created DESC, id DESC LIMIT 1`,
         )
-        .get();
+        .get(integrationId);
       const stored =
         typeof row?.value === "string"
           ? Option.getOrUndefined(decodeStoredKey(row.value))
@@ -69,7 +79,10 @@ const readConsoleApiKey = (databasePath: string) =>
     } finally {
       database.close();
     }
-  }).pipe(Effect.orElseSucceed(() => undefined));
+  }).pipe(
+    Effect.map((key): StoredKeyRead => (key ? { _tag: "key", key } : { _tag: "missing" })),
+    Effect.orElseSucceed((): StoredKeyRead => ({ _tag: "unreadable" })),
+  );
 
 /** External OpenCode servers own their credentials; never read the host's account for them. */
 export const readOpenCodeGoUsageLimits = Effect.fn("readOpenCodeGoUsageLimits")(function* (input: {
@@ -93,27 +106,57 @@ export const readOpenCodeGoUsageLimits = Effect.fn("readOpenCodeGoUsageLimits")(
         "share",
       );
     const authPath = path.join(dataHome, "opencode", "auth.json");
-    const contents =
-      env.OPENCODE_AUTH_CONTENT ||
-      (yield* fs.readFileString(authPath).pipe(
-        Effect.catchTags({
-          PlatformError: (error) =>
-            error.reason._tag === "NotFound" ? Effect.succeed("{}") : Effect.fail(error),
-        }),
-      ));
-    const auth = yield* decodeAuthFile(contents);
-    const apiAuth = decodeApiAuth(auth["opencode-go"]);
-    // OpenCode overlays stored API credentials after environment credentials.
-    const goKey = (Option.isSome(apiAuth) ? apiAuth.value.key : env.OPENCODE_API_KEY)?.trim();
-    // Console supplies Go credentials in OpenCode 2. Inline auth explicitly
-    // overrides local credentials, including the Console connection.
+    // A Go model request is served by the "opencode-go" credential and that is
+    // the one rotation switches, so it answers the snapshot; the Console key
+    // only speaks when no Go login is stored.
     const databaseFile = env.OPENCODE_DB ?? "opencode.db";
-    const consoleKey =
+    const databasePath =
       env.OPENCODE_AUTH_CONTENT || databaseFile === ":memory:"
         ? undefined
-        : yield* readConsoleApiKey(path.resolve(dataHome, "opencode", databaseFile));
-    let apiKey = consoleKey || goKey;
-    if (!apiKey) return unsupported;
+        : path.resolve(dataHome, "opencode", databaseFile);
+    // No database means no stored credential; an unreadable one is a failure,
+    // not an empty account.
+    const databaseExists = databasePath ? yield* fs.exists(databasePath) : false;
+    const goRead: StoredKeyRead =
+      databasePath && databaseExists
+        ? yield* readStoredApiKey(databasePath, "opencode-go")
+        : { _tag: "missing" };
+    const consoleRead: StoredKeyRead =
+      databasePath && databaseExists
+        ? yield* readStoredApiKey(databasePath, "opencode")
+        : { _tag: "missing" };
+    // The stored account is the only one that reflects what the CLI will spend.
+    // Publishing another source's numbers after a failed read is how a closed
+    // window gets attributed to the wrong account.
+    if (goRead._tag === "unreadable" || consoleRead._tag === "unreadable")
+      return makeUnavailableUsageLimits({
+        checkedAt,
+        reason: "probeFailed",
+        message: "OpenCode Go could not read its stored credential.",
+      });
+    const storedKeys = [goRead, consoleRead].flatMap((read) =>
+      read._tag === "key" ? [read.key] : [],
+    );
+    // The file is the last resort, so a missing, unreadable or malformed one
+    // must not stop the stored account from being reported.
+    const goKey = yield* Effect.gen(function* () {
+      const contents =
+        env.OPENCODE_AUTH_CONTENT ||
+        (yield* fs.readFileString(authPath).pipe(
+          Effect.catchTags({
+            PlatformError: (error) =>
+              error.reason._tag === "NotFound" ? Effect.succeed("{}") : Effect.fail(error),
+          }),
+        ));
+      const auth = yield* decodeAuthFile(contents);
+      const apiAuth = decodeApiAuth(auth["opencode-go"]);
+      // OpenCode overlays stored API credentials after environment credentials.
+      return (Option.isSome(apiAuth) ? apiAuth.value.key : env.OPENCODE_API_KEY)?.trim();
+    }).pipe(Effect.orElseSucceed(() => env.OPENCODE_API_KEY?.trim()));
+    const [firstKey, ...otherKeys] = [...storedKeys, goKey].filter((key): key is string =>
+      Boolean(key),
+    );
+    if (!firstKey) return unsupported;
 
     const client = yield* HttpClient.HttpClient;
     const readUsage = (key: string) =>
@@ -122,9 +165,14 @@ export const readOpenCodeGoUsageLimits = Effect.fn("readOpenCodeGoUsageLimits")(
           HttpClientRequest.bearerToken(key),
         ),
       );
+    // 401 rejects this credential and 403 rejects Go entitlement; a later
+    // source can still hold a usable key, so only a decisive answer stops.
+    let apiKey = firstKey;
     let response = yield* readUsage(apiKey);
-    if ((response.status === 401 || response.status === 403) && goKey && goKey !== apiKey) {
-      apiKey = goKey;
+    for (const key of otherKeys) {
+      if (response.status !== 401 && response.status !== 403) break;
+      if (key === apiKey) continue;
+      apiKey = key;
       response = yield* readUsage(apiKey);
     }
     // A valid Zen key can exist without a Go subscription.

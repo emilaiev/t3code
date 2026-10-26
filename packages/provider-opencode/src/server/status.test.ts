@@ -224,6 +224,235 @@ it.effect(
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
+it.effect("reads a locally stored Go key before the legacy auth.json key", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const dataHome = yield* fs.makeTempDirectoryScoped();
+    yield* fs.makeDirectory(`${dataHome}/opencode`);
+    yield* fs.writeFileString(
+      `${dataHome}/opencode/auth.json`,
+      JSON.stringify({ "opencode-go": { type: "api", key: "stale-file-key" } }),
+    );
+    const database = yield* Effect.acquireRelease(
+      Effect.sync(() => new NodeSqlite.DatabaseSync(`${dataHome}/opencode/opencode.db`)),
+      (database) => Effect.sync(() => database.close()),
+    );
+    database.exec(
+      "CREATE TABLE credential (id text PRIMARY KEY, integration_id text, value text, active integer, time_created integer, time_updated integer)",
+    );
+    const insert = database.prepare("INSERT INTO credential VALUES (?, ?, ?, ?, ?, ?)");
+    const window = { percent: 1, resetsAt: "2026-09-17T12:00:00.000Z" };
+    const consoleKey = { type: "key", key: "console-key" };
+    const storedGoKey = { type: "key", key: "stored-go-key" };
+    const fingerprints = new Map([
+      ["console-key", "3e45cfde9158185930d4cc7020a4e390895574fd54bd8f9631d23a336bbf94f0"],
+      ["stored-go-key", "cd430b4316ef60707af8248d498d730dea10c4760967086e6ffd7f0f9f00d80c"],
+      ["stale-file-key", "c42f335560695fe072b90434ef51dc96f4db5130520ae4995ad25f949dfea0e1"],
+    ]);
+    type StoredGoCase = {
+      rows: readonly (readonly [string, string, unknown, number | null, number])[];
+      requested: readonly string[];
+      consoleStatus?: number;
+      storedGoStatus?: number;
+      fileStatus?: number;
+      reason?: "unsupported";
+    };
+    const cases: StoredGoCase[] = [
+      // A Go login lives under its own integration id; the legacy file may be stale.
+      { rows: [["cred_go", "opencode-go", storedGoKey, 1, 5]], requested: ["stored-go-key"] },
+      // An inactive Go row is not a selection.
+      {
+        rows: [["cred_go", "opencode-go", storedGoKey, 0, 5]],
+        requested: ["stale-file-key"],
+      },
+      // The Go login answers when a Console connection also exists: it is what
+      // serves a Go model request, whatever the row timestamps say.
+      {
+        rows: [
+          ["cred_console", "opencode", consoleKey, 1, 1],
+          ["cred_go", "opencode-go", storedGoKey, 1, 5],
+        ],
+        requested: ["stored-go-key"],
+      },
+      // A self-hosted Go connection owns its own credentials.
+      {
+        rows: [
+          [
+            "cred_go",
+            "opencode-go",
+            { ...storedGoKey, metadata: { server: "https://console.example" } },
+            1,
+            5,
+          ],
+        ],
+        requested: ["stale-file-key"],
+      },
+      // An expired stored key still falls back to the file.
+      {
+        rows: [["cred_go", "opencode-go", storedGoKey, 1, 5]],
+        storedGoStatus: 401,
+        requested: ["stored-go-key", "stale-file-key"],
+      },
+      // A rejected Go login still answers from the Console key behind it.
+      {
+        rows: [
+          ["cred_console", "opencode", consoleKey, 1, 1],
+          ["cred_go", "opencode-go", storedGoKey, 1, 5],
+        ],
+        storedGoStatus: 401,
+        requested: ["stored-go-key", "console-key"],
+      },
+      // Only when every source is rejected is there no Go subscription.
+      {
+        rows: [
+          ["cred_console", "opencode", consoleKey, 1, 1],
+          ["cred_go", "opencode-go", storedGoKey, 1, 5],
+        ],
+        consoleStatus: 403,
+        storedGoStatus: 403,
+        fileStatus: 403,
+        reason: "unsupported",
+        requested: ["stored-go-key", "console-key", "stale-file-key"],
+      },
+    ];
+    for (const {
+      rows,
+      requested,
+      consoleStatus = 200,
+      storedGoStatus = 200,
+      fileStatus = 200,
+      reason,
+    } of cases) {
+      database.exec("DELETE FROM credential");
+      for (const [id, integrationId, value, active, created] of rows) {
+        insert.run(id, integrationId, JSON.stringify(value), active, created, created);
+      }
+      const authorizations: string[] = [];
+      const limits = yield* readOpenCodeGoUsageLimits({
+        enabled: true,
+        serverUrl: "",
+        environment: { XDG_DATA_HOME: dataHome },
+      }).pipe(
+        Effect.provideService(
+          HttpClient.HttpClient,
+          HttpClient.make((request) => {
+            NodeAssert.equal(request.url, "https://opencode.ai/zen/go/v1/usage");
+            const key = (request.headers.authorization ?? "").replace("Bearer ", "");
+            authorizations.push(key);
+            const status =
+              key === "console-key"
+                ? consoleStatus
+                : key === "stored-go-key"
+                  ? storedGoStatus
+                  : key === "stale-file-key"
+                    ? fileStatus
+                    : 401;
+            return Effect.succeed(
+              HttpClientResponse.fromWeb(
+                request,
+                Response.json(
+                  { usage: { rolling: window, weekly: window, monthly: window } },
+                  { status },
+                ),
+              ),
+            );
+          }),
+        ),
+      );
+      NodeAssert.deepEqual(authorizations, requested);
+      NodeAssert.equal(limits.unavailable?.reason, reason);
+      NodeAssert.equal(limits.windows.length, reason === undefined ? 3 : 0);
+      NodeAssert.equal(
+        limits.credentialFingerprint,
+        reason === undefined ? fingerprints.get(requested.at(-1)!) : undefined,
+      );
+    }
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("reports unreadable storage rather than another account's usage", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const dataHome = yield* fs.makeTempDirectoryScoped();
+    yield* fs.makeDirectory(`${dataHome}/opencode`);
+    yield* fs.writeFileString(
+      `${dataHome}/opencode/auth.json`,
+      JSON.stringify({ "opencode-go": { type: "api", key: "stale-file-key" } }),
+    );
+    // Present but not a database: the stored-account read fails, and the legacy
+    // file must not be published in its place.
+    yield* fs.writeFileString(`${dataHome}/opencode/opencode.db`, "not a database");
+    const authorizations: string[] = [];
+    const limits = yield* readOpenCodeGoUsageLimits({
+      enabled: true,
+      serverUrl: "",
+      environment: { XDG_DATA_HOME: dataHome },
+    }).pipe(
+      Effect.provideService(
+        HttpClient.HttpClient,
+        HttpClient.make((request) => {
+          authorizations.push((request.headers.authorization ?? "").replace("Bearer ", ""));
+          return Effect.succeed(
+            HttpClientResponse.fromWeb(request, Response.json({}, { status: 200 })),
+          );
+        }),
+      ),
+    );
+    NodeAssert.deepEqual(authorizations, []);
+    NodeAssert.equal(limits.unavailable?.reason, "probeFailed");
+    NodeAssert.equal(limits.windows.length, 0);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("ignores an unreadable legacy file when a stored key exists", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const dataHome = yield* fs.makeTempDirectoryScoped();
+    yield* fs.makeDirectory(`${dataHome}/opencode`);
+    yield* fs.writeFileString(`${dataHome}/opencode/auth.json`, "{ not json");
+    const database = yield* Effect.acquireRelease(
+      Effect.sync(() => new NodeSqlite.DatabaseSync(`${dataHome}/opencode/opencode.db`)),
+      (database) => Effect.sync(() => database.close()),
+    );
+    database.exec(
+      "CREATE TABLE credential (id text PRIMARY KEY, integration_id text, value text, active integer, time_created integer, time_updated integer)",
+    );
+    database
+      .prepare("INSERT INTO credential VALUES (?, ?, ?, ?, ?, ?)")
+      .run(
+        "cred_go",
+        "opencode-go",
+        JSON.stringify({ type: "key", key: "stored-go-key" }),
+        1,
+        5,
+        5,
+      );
+    const window = { percent: 0.19, resetsAt: "2026-12-07T21:42:05.000Z" };
+    const authorizations: string[] = [];
+    const limits = yield* readOpenCodeGoUsageLimits({
+      enabled: true,
+      serverUrl: "",
+      environment: { XDG_DATA_HOME: dataHome },
+    }).pipe(
+      Effect.provideService(
+        HttpClient.HttpClient,
+        HttpClient.make((request) => {
+          authorizations.push((request.headers.authorization ?? "").replace("Bearer ", ""));
+          return Effect.succeed(
+            HttpClientResponse.fromWeb(
+              request,
+              Response.json({ usage: { rolling: window, weekly: window, monthly: window } }),
+            ),
+          );
+        }),
+      ),
+    );
+    NodeAssert.deepEqual(authorizations, ["stored-go-key"]);
+    NodeAssert.equal(limits.unavailable, undefined);
+    NodeAssert.equal(limits.windows.length, 3);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.effect("does not read local credentials for external or disabled OpenCode instances", () =>
   Effect.gen(function* () {
     for (const settings of [
