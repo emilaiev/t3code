@@ -99,13 +99,25 @@ function usageWindowEquals(a: ServerProviderUsageWindow, b: ServerProviderUsageW
   );
 }
 
+// A failed read says nothing about which account it failed on, so the last
+// numbers may only be reused when the fingerprint proves it is the same one.
+function sameCredential(
+  published: ServerProviderUsageLimits,
+  probed: ServerProviderUsageLimits,
+): boolean {
+  const left = published.credentialFingerprint;
+  const right = probed.credentialFingerprint;
+  if (left === undefined && right === undefined) return true;
+  return left !== undefined && right !== undefined && left === right;
+}
+
 export function resolveUsageLimitsAfterProbe(input: {
   readonly published: ServerProviderUsageLimits | undefined;
   readonly probed: ServerProviderUsageLimits | undefined;
 }): ServerProviderUsageLimits | undefined {
   const { published, probed } = input;
   if (probed?.unavailable?.reason === "probeFailed" && published && !published.unavailable) {
-    return published;
+    return sameCredential(published, probed) ? published : probed;
   }
   if (
     published &&
