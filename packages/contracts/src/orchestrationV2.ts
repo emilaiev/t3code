@@ -346,12 +346,22 @@ export const OrchestrationV2ProviderCapabilities = Schema.Struct({
 });
 export type OrchestrationV2ProviderCapabilities = typeof OrchestrationV2ProviderCapabilities.Type;
 
+export const OrchestrationV2QuotaSwitch = Schema.Struct({
+  sourceRunId: RunId,
+  sourceInstanceId: ProviderInstanceId,
+  pendingInstanceId: Schema.NullOr(ProviderInstanceId),
+  triedInstanceIds: Schema.Array(ProviderInstanceId),
+  opened: Schema.Boolean,
+});
+export type OrchestrationV2QuotaSwitch = typeof OrchestrationV2QuotaSwitch.Type;
+
 export const OrchestrationV2LimitRecovery = Schema.Struct({
   requestId: Schema.optional(CommandId),
   runId: RunId,
   resetAt: IsoDateTime,
   autoResume: Schema.Boolean,
   snooze: Schema.optional(Schema.Boolean),
+  quotaSwitch: Schema.optional(OrchestrationV2QuotaSwitch),
 });
 export type OrchestrationV2LimitRecovery = typeof OrchestrationV2LimitRecovery.Type;
 
@@ -360,6 +370,7 @@ export const OrchestrationV2LimitRecoveryUpdate = Schema.Struct({
   resetAt: IsoDateTime,
   autoResume: Schema.optional(Schema.Boolean),
   snooze: Schema.optional(Schema.Boolean),
+  quotaSwitch: Schema.optional(OrchestrationV2QuotaSwitch),
 }).check(
   Schema.makeFilter(
     (update) =>

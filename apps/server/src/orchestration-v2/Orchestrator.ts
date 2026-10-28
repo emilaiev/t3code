@@ -122,6 +122,7 @@ import {
   type ProjectionCheckpointContext,
   type ShellSnapshotOptions,
 } from "./ProjectionStore.ts";
+import { stoppedQuotaSwitch } from "./quotaContinuation.ts";
 import { ProviderAdapterRegistryV2 } from "./ProviderAdapterRegistry.ts";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
@@ -275,6 +276,29 @@ export class OrchestratorCommandIdConflictError extends Schema.TaggedError<Orche
  */
 function canReplayCommandReceipt(receiptThreadId: ThreadId, commandThreadId: ThreadId): boolean {
   return receiptThreadId === commandThreadId;
+}
+
+function sameQuotaSwitch(
+  left:
+    | {
+        readonly sourceRunId: string;
+        readonly sourceInstanceId: string;
+        readonly pendingInstanceId: string | null;
+        readonly triedInstanceIds: ReadonlyArray<string>;
+        readonly opened: boolean;
+      }
+    | undefined,
+  right: typeof left,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return (
+    left.sourceRunId === right.sourceRunId &&
+    left.sourceInstanceId === right.sourceInstanceId &&
+    left.pendingInstanceId === right.pendingInstanceId &&
+    left.opened === right.opened &&
+    left.triedInstanceIds.length === right.triedInstanceIds.length &&
+    left.triedInstanceIds.every((id, index) => id === right.triedInstanceIds[index])
+  );
 }
 
 export const OrchestratorV2Error = Schema.Union([
@@ -2966,6 +2990,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const run = usageLimitBlockedRun(projection.runs, projection.turnItems, null);
       const failure = latestRootProviderFailure(run, projection.turnItems);
       const resetMs = Date.parse(command.limitRecovery.resetAt);
+      const incomingSwitch = command.limitRecovery.quotaSwitch;
+      const storedSwitch = thread.limitRecovery?.quotaSwitch;
+      // The first hop is written while the usage-limit run is still latest.
+      // A later hop updates only the switch, after that run is no longer latest.
+      const advancingSwitch =
+        incomingSwitch !== undefined &&
+        storedSwitch !== undefined &&
+        storedSwitch.sourceRunId === incomingSwitch.sourceRunId &&
+        thread.limitRecovery?.runId === command.limitRecovery.runId &&
+        thread.limitRecovery?.resetAt === command.limitRecovery.resetAt;
       if (command.limitRecovery.snooze === true && resetMs <= DateTime.toEpochMillis(now)) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
@@ -2977,11 +3011,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         !Number.isFinite(resetMs) ||
         thread.archivedAt !== null ||
         thread.settledOverride === "settled" ||
-        run?.id !== command.limitRecovery.runId ||
-        failure?.class !== "usage_limit" ||
-        failure.resetAt !== command.limitRecovery.resetAt ||
-        resetMs <= DateTime.toEpochMillis(run.completedAt ?? run.requestedAt) ||
-        projection.runtimeRequests.some((request) => request.status === "pending")
+        projection.runtimeRequests.some((request) => request.status === "pending") ||
+        (!advancingSwitch &&
+          (run?.id !== command.limitRecovery.runId ||
+            failure?.class !== "usage_limit" ||
+            failure.resetAt !== command.limitRecovery.resetAt ||
+            resetMs <= DateTime.toEpochMillis(run.completedAt ?? run.requestedAt)))
       ) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
@@ -3173,18 +3208,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             thread.limitRecovery?.resetAt === command.limitRecovery?.resetAt
               ? thread.limitRecovery
               : null;
-          const limitRecovery =
-            command.limitRecovery === undefined
-              ? thread.limitRecovery
-              : command.limitRecovery === null
-                ? null
-                : {
-                    ...command.limitRecovery,
-                    autoResume:
-                      command.limitRecovery.autoResume ?? previousRecovery?.autoResume ?? false,
-                    snooze: command.limitRecovery.snooze ?? previousRecovery?.snooze ?? false,
-                    requestId: command.commandId,
-                  };
+          const incoming = command.limitRecovery;
+          const limitRecovery = (() => {
+            if (incoming === undefined) return thread.limitRecovery;
+            if (incoming === null) return null;
+            const { quotaSwitch: commandSwitch, ...recoveryFields } = incoming;
+            const carriedSwitch =
+              commandSwitch !== undefined
+                ? commandSwitch
+                : previousRecovery?.quotaSwitch?.opened === true
+                  ? previousRecovery.quotaSwitch
+                  : thread.limitRecovery?.quotaSwitch?.opened === true
+                    ? thread.limitRecovery.quotaSwitch
+                    : undefined;
+            return {
+              ...recoveryFields,
+              autoResume: incoming.autoResume ?? previousRecovery?.autoResume ?? false,
+              snooze: incoming.snooze ?? previousRecovery?.snooze ?? false,
+              requestId: command.commandId,
+              ...(carriedSwitch === undefined ? {} : { quotaSwitch: carriedSwitch }),
+            };
+          })();
           return {
             ...thread,
             ...(command.title === undefined ? {} : { title: command.title }),
@@ -4806,6 +4850,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
   ) {
     let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+    if (String(command.commandId).startsWith("quota-switch-send:")) {
+      const armed = projection.thread.limitRecovery?.quotaSwitch;
+      if (
+        armed?.opened === true ||
+        armed?.pendingInstanceId !== command.modelSelection?.instanceId
+      ) {
+        return;
+      }
+    }
     if (command.manualContinuationOfRunId !== undefined) {
       const source = projection.runs.find((run) => run.id === command.manualContinuationOfRunId);
       const limited = latestRootProviderFailure(source ?? null, projection.turnItems);
@@ -9164,6 +9217,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         };
       }
     }
+    const stoppedSwitch = stoppedQuotaSwitch(thread.limitRecovery?.quotaSwitch);
+    if (stoppedSwitch !== null) {
+      const base = recovery ?? thread.limitRecovery;
+      if (base && base.quotaSwitch !== stoppedSwitch) {
+        recovery = { ...base, quotaSwitch: stoppedSwitch };
+      }
+    }
     if (recovery && (recovery !== thread.limitRecovery || recovery.autoResume)) {
       thread = {
         ...thread,
@@ -12086,10 +12146,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 (cause) => new OrchestratorProjectionError({ threadId: input.threadId, cause }),
               ),
             );
-          // Stop or an explicit recovery choice can commit after the sweep reads its candidate.
+          // Stop can commit after the sweep reads its candidate. An opened walk
+          // is not re-armed by that stale read.
           if (
             thread.limitRecovery?.runId === input.limitRecovery.runId &&
-            thread.limitRecovery.resetAt === input.limitRecovery.resetAt
+            thread.limitRecovery.resetAt === input.limitRecovery.resetAt &&
+            (thread.limitRecovery.quotaSwitch?.opened === true ||
+              sameQuotaSwitch(thread.limitRecovery.quotaSwitch, input.limitRecovery.quotaSwitch))
           )
             return;
           yield* dispatchWithReceiptEffect({ type: "thread.metadata.update", ...input });
