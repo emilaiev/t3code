@@ -23,6 +23,13 @@ const handlers = {
       return yield* service.delegateTask(scope, input);
     }),
   ),
+  t3x_bridge_launch: McpToolAccess.actsAsCaller((input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+      return yield* service.launchT3x(scope, input);
+    }),
+  ),
   task_status: McpToolAccess.actsAsCaller(({ taskId }) =>
     Effect.gen(function* () {
       const scope = yield* McpInvocationContext.McpInvocationContext;

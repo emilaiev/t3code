@@ -52,6 +52,8 @@ import {
   type OrchestratorMcpThreadTimelineItem,
   type OrchestratorMcpThreadWaitInput,
   type OrchestratorMcpThreadWaitResult,
+  type OrchestratorMcpT3xLaunchInput,
+  type OrchestratorMcpT3xLaunchResult,
   type ProviderInteractionMode,
   type ProviderInstanceId,
   type ProviderOptionDescriptor,
@@ -113,6 +115,7 @@ import {
 } from "./McpInvocationContext.ts";
 import * as Metrics from "../observability/Metrics.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
+import * as T3xBridgeService from "./T3xBridgeService.ts";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1_000;
 const MAX_WAIT_TIMEOUT_MS = 60 * 60 * 1_000;
@@ -150,6 +153,10 @@ export interface OrchestratorMcpServiceShape {
     scope: McpInvocationScope,
     input: OrchestratorMcpDelegateTaskInput,
   ) => Effect.Effect<OrchestratorMcpDelegateTaskResult, OrchestratorMcpFailure>;
+  readonly launchT3x: (
+    scope: McpInvocationScope,
+    input: OrchestratorMcpT3xLaunchInput,
+  ) => Effect.Effect<OrchestratorMcpT3xLaunchResult, OrchestratorMcpFailure>;
   readonly taskStatus: (
     scope: McpInvocationScope,
     taskId: NodeId,
@@ -1077,6 +1084,7 @@ const make = Effect.gen(function* () {
   const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
   const gitDriver = yield* GitVcsDriver.GitVcsDriver;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const t3xBridge = yield* T3xBridgeService.T3xBridgeService;
 
   const requireProject = (projectId: ProjectId) =>
     projects.getById(projectId).pipe(
@@ -2205,6 +2213,37 @@ const make = Effect.gen(function* () {
         },
       };
     }),
+    launchT3x: Effect.fn("OrchestratorMcpService.launchT3x")(function* (callerScope, input) {
+      if (typeof input.clientRequestId !== "string" || input.clientRequestId.trim().length === 0) {
+        return yield* failure(
+          "invalid_request",
+          "T3X bridge launch requires a stable clientRequestId; reuse it only for an exact retry.",
+        );
+      }
+      const { scope, parent } = yield* loadThreadCaller(callerScope, "t3x_bridge_launch");
+      const parentRun = parent.runs
+        .filter(ThreadManagementService.isActiveRun)
+        .toSorted((left, right) => right.ordinal - left.ordinal)[0];
+      if (
+        parentRun === undefined ||
+        parentRun.rootNodeId === null ||
+        parentRun.providerInstanceId !== scope.thread.providerInstanceId
+      ) {
+        return yield* failure(
+          "parent_not_active",
+          "T3X bridge launches require an active parent run on this MCP provider instance.",
+        );
+      }
+      return yield* t3xBridge.launch({
+        requestKey: input.clientRequestId,
+        parent: {
+          environmentId: scope.environmentId,
+          threadId: scope.thread.threadId,
+          runId: parentRun.id,
+        },
+        launch: input,
+      });
+    }),
     delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
       const { scope, parent } = yield* loadThreadCaller(callerScope, "delegate_task");
       const parentRun = parent.runs
@@ -3019,4 +3058,5 @@ export const layer: Layer.Layer<
   | ProjectService.ProjectService
   | SecretRequests.SecretRequests
   | ServerSettings.ServerSettingsService
+  | T3xBridgeService.T3xBridgeService
 > = Layer.effect(OrchestratorMcpService, make);

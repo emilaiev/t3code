@@ -14,3 +14,18 @@ it("states t3_thread_read page size limits in the parameter descriptions", () =>
     expect(schema.properties[name]?.description, name).toContain(maximum);
   }
 });
+
+it("registers the thread-scoped T3X bridge tool without caller-supplied parent IDs", () => {
+  const tool = OrchestratorToolkit.tools.t3x_bridge_launch;
+  const schema = Tool.getJsonSchema(tool) as {
+    readonly properties: Readonly<Record<string, unknown>>;
+    readonly required?: ReadonlyArray<string>;
+  };
+  expect(schema.properties).toHaveProperty("host");
+  expect(schema.properties).toHaveProperty("task");
+  expect(schema.properties).not.toHaveProperty("parent");
+  expect(schema.properties).not.toHaveProperty("environmentId");
+  expect(schema.properties).not.toHaveProperty("threadId");
+  expect(schema.properties).not.toHaveProperty("runId");
+  expect(schema.required).toContain("clientRequestId");
+});

@@ -292,6 +292,49 @@ export const OrchestratorMcpCreateThreadsResult = Schema.Struct({
 });
 export type OrchestratorMcpCreateThreadsResult = typeof OrchestratorMcpCreateThreadsResult.Type;
 
+const OrchestratorMcpT3xWorkspace = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("root") }),
+  Schema.Struct({
+    type: Schema.Literal("worktree"),
+    baseRef: TrimmedNonEmptyString,
+    branch: Schema.optional(TrimmedNonEmptyString),
+    startFromOrigin: Schema.optional(Schema.Boolean),
+  }),
+]);
+
+/** Launch choices only. Parent environment/thread/run are added from MCP scope on the server. */
+export const OrchestratorMcpT3xLaunchInput = Schema.Struct({
+  host: Schema.Literals(["wsl", "win", "mac"]),
+  cli: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  task: OrchestratorMcpPrompt,
+  model: TrimmedNonEmptyString.check(Schema.isMaxLength(512)),
+  effort: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(128))),
+  role: Schema.optional(Schema.Literals(["worker", "checker", "researcher", "sublead"])),
+  goal: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(256))),
+  projectId: Schema.optional(ProjectId),
+  titleSource: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(256))),
+  keepOpen: Schema.optional(Schema.Boolean),
+  workspace: Schema.optional(OrchestratorMcpT3xWorkspace),
+  clientRequestId: OrchestratorMcpClientRequestId,
+});
+export type OrchestratorMcpT3xLaunchInput = typeof OrchestratorMcpT3xLaunchInput.Type;
+
+export const OrchestratorMcpT3xLaunchResult = Schema.Struct({
+  jobId: TrimmedNonEmptyString,
+  target: Schema.NullOr(
+    Schema.Struct({
+      host: Schema.Literals(["wsl", "win", "mac"]),
+      threadId: ThreadId,
+      runId: RunId,
+    }),
+  ),
+  state: Schema.optional(TrimmedNonEmptyString),
+  result: Schema.optional(Schema.Json),
+  error: Schema.optional(Schema.String),
+  detail: Schema.optional(Schema.String),
+});
+export type OrchestratorMcpT3xLaunchResult = typeof OrchestratorMcpT3xLaunchResult.Type;
+
 export const OrchestratorMcpThreadStatus = Schema.Union([
   Schema.Literal("idle"),
   OrchestrationV2RunStatus,

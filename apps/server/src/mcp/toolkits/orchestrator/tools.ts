@@ -29,6 +29,8 @@ import {
   OrchestratorMcpThreadSendResult,
   OrchestratorMcpThreadWaitInput,
   OrchestratorMcpThreadWaitResult,
+  OrchestratorMcpT3xLaunchInput,
+  OrchestratorMcpT3xLaunchResult,
   ThreadMetadataMcpUpdateInput,
   ThreadMetadataMcpUpdateResult,
 } from "@t3tools/contracts";
@@ -75,6 +77,19 @@ const DelegateTaskTool = Tool.make("delegate_task", {
   dependencies,
 })
   .annotate(Tool.Title, "Delegate a child task")
+  .annotate(Tool.Destructive, true)
+  .annotate(Tool.OpenWorld, true);
+
+const T3xBridgeLaunchTool = Tool.make("t3x_bridge_launch", {
+  description:
+    "Launch cross-host T3X work from the current active T3 thread. Choose the target host, CLI and model; parent environment, thread and run are derived by the server and cannot be supplied here. clientRequestId is required: choose one stable key per logical launch and reuse it only for exact retries. Attribution uses the active run and provider instance because current projections do not bind providerSessionId; it is intended for trusted agents, not protection from malicious same-OS-user processes. Mac-origin is unavailable until a supported signed Mac build includes this tool.",
+  parameters: OrchestratorMcpT3xLaunchInput,
+  success: OrchestratorMcpT3xLaunchResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Launch cross-host T3X work")
   .annotate(Tool.Destructive, true)
   .annotate(Tool.OpenWorld, true);
 
@@ -276,6 +291,7 @@ const ThreadInterruptTool = Tool.make("t3_thread_interrupt", {
 export const OrchestratorToolkit = Toolkit.make(
   OrchestratorCapabilitiesTool,
   DelegateTaskTool,
+  T3xBridgeLaunchTool,
   TaskStatusTool,
   TaskCancelTool,
   WorkflowStopTool,

@@ -4,10 +4,14 @@ import * as Schema from "effect/Schema";
 import {
   OrchestratorMcpDelegateTaskInput,
   OrchestratorMcpDelegateTaskResult,
+  OrchestratorMcpT3xLaunchInput,
+  OrchestratorMcpT3xLaunchResult,
 } from "./orchestratorMcp.ts";
 
 const decodeDelegateTaskInput = Schema.decodeUnknownSync(OrchestratorMcpDelegateTaskInput);
 const decodeDelegateTaskResult = Schema.decodeUnknownSync(OrchestratorMcpDelegateTaskResult);
+const decodeT3xLaunchInput = Schema.decodeUnknownSync(OrchestratorMcpT3xLaunchInput);
+const decodeT3xLaunchResult = Schema.decodeUnknownSync(OrchestratorMcpT3xLaunchResult);
 
 describe("orchestrator MCP contracts", () => {
   it("decodes cross-provider delegated task requests and durable results", () => {
@@ -63,6 +67,69 @@ describe("orchestrator MCP contracts", () => {
       decodeDelegateTaskResult({
         ...result,
         pendingApproval: { ...pendingApproval, kind: "user_input" },
+      }),
+    ).toThrow();
+  });
+
+  it("keeps T3X launch input free of server-derived parent identity", () => {
+    const launch = decodeT3xLaunchInput({
+      host: "win",
+      cli: "codex",
+      task: "Run the task.",
+      model: "gpt-6-luna",
+      clientRequestId: "t3x-logical-request-1",
+      parent: { environmentId: "forged-env", threadId: "forged-thread", runId: "forged-run" },
+      environmentId: "forged-env",
+      threadId: "forged-thread",
+      runId: "forged-run",
+    });
+    expect(launch).not.toHaveProperty("parent");
+    expect(launch).not.toHaveProperty("environmentId");
+    expect(launch).not.toHaveProperty("threadId");
+    expect(launch).not.toHaveProperty("runId");
+    expect(() =>
+      decodeT3xLaunchInput({ host: "win", cli: "codex", task: "Run it", model: "m" }),
+    ).toThrow();
+    expect(() => decodeT3xLaunchInput({ ...launch, host: "invalid-host" })).toThrow();
+  });
+
+  it("decodes unbound T3X receipts and requires exact IDs when a target is bound", () => {
+    const uncertain = decodeT3xLaunchResult({
+      jobId: "job:uncertain",
+      target: null,
+      state: "uncertain",
+      error: "launch binding is not yet visible",
+    });
+    expect(uncertain).toEqual({
+      jobId: "job:uncertain",
+      target: null,
+      state: "uncertain",
+      error: "launch binding is not yet visible",
+    });
+
+    const bound = decodeT3xLaunchResult({
+      jobId: "job:bound",
+      target: { host: "win", threadId: "thread:target", runId: "run:target" },
+    });
+    expect(bound.target).toEqual({ host: "win", threadId: "thread:target", runId: "run:target" });
+    for (const host of ["wsl", "win", "mac"] as const) {
+      expect(
+        decodeT3xLaunchResult({
+          jobId: `job:${host}`,
+          target: { host, threadId: "thread:target", runId: "run:target" },
+        }).target,
+      ).toEqual({ host, threadId: "thread:target", runId: "run:target" });
+    }
+    expect(() =>
+      decodeT3xLaunchResult({
+        jobId: "job:bound",
+        target: { host: "other", threadId: "thread:target", runId: "run:target" },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeT3xLaunchResult({
+        jobId: "job:bound",
+        target: { host: "win", threadId: "thread:target" },
       }),
     ).toThrow();
   });

@@ -8,6 +8,7 @@ export interface T3McpToolPresentation {
 export type T3McpToolSummaryAction =
   | "capabilities"
   | "delegate"
+  | "t3x-bridge"
   | "task-status"
   | "task-cancel"
   | "schedule-run"
@@ -125,6 +126,7 @@ const T3_MCP_TOOLS: Readonly<Record<string, T3McpToolDefinition>> = {
     "capabilities",
   ),
   delegate_task: tool(["Delegate", "Delegating", "Delegated", "a child task"], "delegate"),
+  t3x_bridge_launch: tool(["Launch", "Launching", "Launched", "cross-host T3X work"], "t3x-bridge"),
   task_status: tool(["Get", "Getting", "Got", "delegated task status"], "task-status"),
   task_cancel: tool(
     ["Cancel", "Canceling", "Requested cancellation of", "a delegated task"],
