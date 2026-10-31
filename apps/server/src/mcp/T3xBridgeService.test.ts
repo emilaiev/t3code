@@ -275,6 +275,23 @@ it.effect("fails closed on process errors, timeout, and non-zero exit", () =>
       invoke({ requestKey: "request-6", parent, launch }),
     ).pipe(Effect.flip);
     expect(refused.message).toContain("no runnable instance matches 'antigravity'");
+
+    // A runner-level refusal exits 0 with `ok:false`; the reason must survive too.
+    const runnerRefusal = yield* provideBridge(
+      () =>
+        Effect.succeed(
+          successfulOutput(
+            JSON.stringify({
+              ok: false,
+              state: "rejected",
+              jobId: null,
+              error: "model 'gemini-3.8-flash-low' is not in antigravity's list",
+            }),
+          ),
+        ),
+      invoke({ requestKey: "request-7", parent, launch }),
+    ).pipe(Effect.flip);
+    expect(runnerRefusal.message).toContain("is not in antigravity's list");
   }),
 );
 

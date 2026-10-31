@@ -102,14 +102,18 @@ export class T3xBridgeService extends Context.Service<
 const fail = (message: string) =>
   new OrchestratorMcpFailure({ code: "orchestration_error", message });
 
-// A refused launch still prints one JSON receipt; surface its reason instead of
-// reporting only the exit code, so an unreachable catalog entry is actionable.
+// A refused launch still prints one JSON receipt with `ok:false`. Surface its
+// reason instead of only an exit code, so an unreachable catalog entry is
+// actionable. T3X exits 2 for input refusals and 0 for a launch that failed
+// inside the runner, so both paths read the same field.
 const refusalMessage = (stdout: string): string | undefined => {
   try {
     const parsed: unknown = JSON.parse(stdout);
     if (
       typeof parsed === "object" &&
       parsed !== null &&
+      "ok" in parsed &&
+      parsed.ok === false &&
       "error" in parsed &&
       typeof parsed.error === "string" &&
       parsed.error.trim().length > 0
@@ -189,12 +193,15 @@ const make = (platform: NodeJS.Platform, environment: NodeJS.ProcessEnv) =>
                 : fail("T3X bridge process failed while reading or writing its result."),
           ),
         );
+      const refusal = refusalMessage(processResult.stdout.trim());
       if (processResult.code !== 0) {
-        const refusal = refusalMessage(processResult.stdout.trim());
         return yield* fail(refusal ?? `T3X bridge exited with code ${String(processResult.code)}.`);
       }
       if (processResult.stdoutInvalidUtf8) {
         return yield* fail("T3X bridge returned malformed UTF-8 output.");
+      }
+      if (refusal !== undefined) {
+        return yield* fail(refusal);
       }
 
       return yield* Schema.decodeEffect(Schema.fromJsonString(OrchestratorMcpT3xLaunchResult))(
