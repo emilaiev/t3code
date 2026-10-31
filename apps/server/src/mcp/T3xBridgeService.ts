@@ -102,6 +102,26 @@ export class T3xBridgeService extends Context.Service<
 const fail = (message: string) =>
   new OrchestratorMcpFailure({ code: "orchestration_error", message });
 
+// A refused launch still prints one JSON receipt; surface its reason instead of
+// reporting only the exit code, so an unreachable catalog entry is actionable.
+const refusalMessage = (stdout: string): string | undefined => {
+  try {
+    const parsed: unknown = JSON.parse(stdout);
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      "error" in parsed &&
+      typeof parsed.error === "string" &&
+      parsed.error.trim().length > 0
+    ) {
+      return parsed.error;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 const cleanLaunch = (input: OrchestratorMcpT3xLaunchInput) => ({
   host: input.host,
   cli: input.cli,
@@ -170,7 +190,8 @@ const make = (platform: NodeJS.Platform, environment: NodeJS.ProcessEnv) =>
           ),
         );
       if (processResult.code !== 0) {
-        return yield* fail(`T3X bridge exited with code ${String(processResult.code)}.`);
+        const refusal = refusalMessage(processResult.stdout.trim());
+        return yield* fail(refusal ?? `T3X bridge exited with code ${String(processResult.code)}.`);
       }
       if (processResult.stdoutInvalidUtf8) {
         return yield* fail("T3X bridge returned malformed UTF-8 output.");

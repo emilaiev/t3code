@@ -5,9 +5,11 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+import { Tool } from "effect/ai";
 
 import * as ProcessRunner from "../processRunner.ts";
 import * as T3xBridgeService from "./T3xBridgeService.ts";
+import { OrchestratorToolkit } from "./toolkits/orchestrator/tools.ts";
 
 const parent = {
   environmentId: EnvironmentId.make("environment:bridge-test"),
@@ -255,6 +257,24 @@ it.effect("fails closed on process errors, timeout, and non-zero exit", () =>
       invoke({ requestKey: "request-5", parent, launch }),
     ).pipe(Effect.flip);
     expect(nonZero.message).toContain("exited with code 2");
+
+    // A refused launch names its reason; an agent must see that, not the exit code.
+    const refused = yield* provideBridge(
+      () =>
+        Effect.succeed({
+          ...successfulOutput(
+            JSON.stringify({
+              ok: false,
+              state: "rejected",
+              jobId: null,
+              error: "no runnable instance matches 'antigravity'",
+            }),
+          ),
+          code: ChildProcessSpawner.ExitCode(2),
+        }),
+      invoke({ requestKey: "request-6", parent, launch }),
+    ).pipe(Effect.flip);
+    expect(refused.message).toContain("no runnable instance matches 'antigravity'");
   }),
 );
 
@@ -322,3 +342,18 @@ it.effect("does not provide a Mac-origin bridge route", () =>
     expect(error.message).toContain("unavailable from this Mac T3 server build");
   }),
 );
+
+it("registers the T3X tool without caller-supplied parent IDs", () => {
+  const tool = OrchestratorToolkit.tools.t3x_bridge_launch;
+  const schema = Tool.getJsonSchema(tool) as {
+    readonly properties: Readonly<Record<string, unknown>>;
+    readonly required?: ReadonlyArray<string>;
+  };
+  expect(schema.properties).toHaveProperty("host");
+  expect(schema.properties).toHaveProperty("task");
+  expect(schema.properties).not.toHaveProperty("parent");
+  expect(schema.properties).not.toHaveProperty("environmentId");
+  expect(schema.properties).not.toHaveProperty("threadId");
+  expect(schema.properties).not.toHaveProperty("runId");
+  expect(schema.required).toContain("clientRequestId");
+});
