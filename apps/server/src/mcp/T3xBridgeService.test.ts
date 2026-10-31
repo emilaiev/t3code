@@ -110,6 +110,39 @@ it.effect("sends only bridge-launch on argv and the validated request on stdin",
   }),
 );
 
+it.effect("turns the completion reply off when notify is false", () =>
+  Effect.gen(function* () {
+    let observed: ProcessRunner.ProcessRunInput | undefined;
+    yield* provideBridge(
+      (input) => {
+        observed = input;
+        return Effect.succeed(
+          successfulOutput(
+            JSON.stringify({
+              jobId: "job-quiet",
+              target: { host: "win", threadId: "thread:t", runId: "run:t" },
+              state: "running",
+            }),
+          ),
+        );
+      },
+      invoke({ requestKey: "request-quiet", parent, launch: { ...launch, notify: false } }),
+    );
+
+    expect(JSON.parse(observed!.stdin!)).toEqual({
+      requestKey: "request-quiet",
+      parent,
+      launch: {
+        host: launch.host,
+        cli: launch.cli,
+        task: launch.task,
+        model: launch.model,
+        replyTo: null,
+      },
+    });
+  }),
+);
+
 it.effect("rejects malformed requests and malformed bridge results", () =>
   Effect.gen(function* () {
     let invoked = false;

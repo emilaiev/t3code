@@ -314,6 +314,8 @@ export const OrchestratorMcpT3xLaunchInput = Schema.Struct({
   projectId: Schema.optional(ProjectId),
   titleSource: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(256))),
   keepOpen: Schema.optional(Schema.Boolean),
+  /** Default true: queue this job's completion reply into the launching thread. */
+  notify: Schema.optional(Schema.Boolean),
   workspace: Schema.optional(OrchestratorMcpT3xWorkspace),
   clientRequestId: OrchestratorMcpClientRequestId,
 });

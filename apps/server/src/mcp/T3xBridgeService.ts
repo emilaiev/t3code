@@ -137,6 +137,9 @@ const cleanLaunch = (input: OrchestratorMcpT3xLaunchInput) => ({
   ...(input.projectId === undefined ? {} : { projectId: input.projectId }),
   ...(input.titleSource === undefined ? {} : { titleSource: input.titleSource }),
   ...(input.keepOpen === undefined ? {} : { keepOpen: input.keepOpen }),
+  // Omitted means "queue one completion reply into the launching thread";
+  // an explicit null turns that off for a fire-and-forget launch.
+  ...(input.notify === false ? { replyTo: null } : {}),
   ...(input.workspace === undefined ? {} : { workspace: input.workspace }),
 });
 
